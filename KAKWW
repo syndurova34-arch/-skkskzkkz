@@ -1,0 +1,3403 @@
+-- Chillhub TSB -- rewritten loader
+-- Target: Roblox / Obsidian UI library (deividcomsono/Obsidian)
+-- Roblox executor required (Synapse/Delta/Wave/etc) for HttpGet, setclipboard, Drawing
+
+local UPDATE_VERSION = "7"
+local UPDATE_NOTES   = "Rewritten core. Music player fix, loader hardening, ESP stability, macro cleanup, safer unload."
+
+local MUSIC_TRACKS = {
+    { name = "Undertale - Megalovania", ids = { "1837879086" } },
+    { name = "Toby Fox - Hopes and Dreams", ids = { "1839491234" } },
+    { name = "Ambient - Calm Loop",     ids = { "9046959403" } },
+}
+
+local RunService          = game:GetService("RunService")
+local Players             = game:GetService("Players")
+local Stats               = game:GetService("Stats")
+local UserInputService    = game:GetService("UserInputService")
+local Lighting            = game:GetService("Lighting")
+local TeleportService     = game:GetService("TeleportService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser         = game:GetService("VirtualUser")
+local HttpService         = game:GetService("HttpService")
+local StarterGui          = game:GetService("StarterGui")
+local SoundService        = game:GetService("SoundService")
+local MarketplaceService  = game:GetService("MarketplaceService")
+local ContextActionService= game:GetService("ContextActionService")
+
+local LocalPlayer   = Players.LocalPlayer
+local LOGO_ASSET_ID = "rbxassetid://83288538700579"
+local ACCENT        = Color3.fromRGB(255, 150, 40)
+local repo          = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+
+-- library load (hard fail if missing)
+local okLib, Library = pcall(function()
+    return loadstring(game:HttpGet(repo .. "Library.lua"))()
+end)
+if not okLib or not Library then
+    error("[Chillhub] failed to load UI library: " .. tostring(Library))
+end
+
+local okTheme, ThemeManager = pcall(function()
+    return loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+end)
+local okSave, SaveManager = pcall(function()
+    return loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+end)
+
+local Options = Library.Options
+local Toggles = Library.Toggles
+
+-- loading screen
+local Loading = Library:CreateLoading({
+    Title      = "Chillhub",
+    Icon       = LOGO_ASSET_ID,
+    TotalSteps = 4,
+})
+task.delay(90, function() pcall(function() Loading:Destroy() end) end)
+
+Loading:SetMessage("YIPPE UR HERE!!!")
+Loading:SetDescription("gettin some things ready hehe")
+task.wait(2)
+Loading:SetCurrentStep(1)
+Loading:SetDescription("Fun fact this is made by 1 guy")
+task.wait(2)
+Loading:SetCurrentStep(2)
+Loading:ShowSidebarPage(true)
+Loading.Sidebar:AddLabel("User: " .. LocalPlayer.Name)
+Loading.Sidebar:AddLabel("Update " .. UPDATE_VERSION)
+task.wait(2)
+Loading:SetCurrentStep(3)
+Loading:SetDescription("Oh look ur save file is ready get it like undertale?")
+task.wait(2)
+
+-- ---------------------------------------------------------------------------
+-- shared state
+-- ---------------------------------------------------------------------------
+local unloaded     = false
+local connections  = {}
+local cleanupFns   = {}
+
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(connections, c)
+    return c
+end
+
+local function onCleanup(fn) table.insert(cleanupFns, fn) end
+
+local function getHumanoid()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function isRagdolled(humanoid)
+    if not humanoid then return false end
+    local fly = Toggles.Universal_Flying_Enabled
+    if humanoid.PlatformStand and not (fly and fly.Value) then return true end
+    local state = humanoid:GetState()
+    return state == Enum.HumanoidStateType.Ragdoll
+        or state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.Physics
+end
+
+local Shared = {
+    flinging          = false,
+    restoreNoclip     = function() end,
+    setTrackerVisible = function(_value) end,
+}
+
+local autoRotateLocks = {}
+local function setAutoRotateLock(name, locked)
+    autoRotateLocks[name] = locked or nil
+    local humanoid = getHumanoid()
+    if humanoid then humanoid.AutoRotate = next(autoRotateLocks) == nil end
+end
+
+connect(LocalPlayer.CharacterAdded, function(character)
+    local humanoid = character:WaitForChild("Humanoid", 10)
+    if humanoid then humanoid.AutoRotate = next(autoRotateLocks) == nil end
+end)
+
+local function resolvePlayer(value)
+    if typeof(value) == "Instance" then return value end
+    if type(value) == "string" then return Players:FindFirstChild(value) end
+    return nil
+end
+
+local function keyFromOption(name)
+    local opt = Options[name]
+    if not opt then return nil end
+    return Enum.KeyCode:FromName(tostring(opt.Value))
+end
+
+local function inputMatchesBind(input, name)
+    local opt = Options[name]
+    if not opt then return false end
+    local value = tostring(opt.Value)
+    if value == "None" then return false end
+    if value == "MB1" then return input.UserInputType == Enum.UserInputType.MouseButton1 end
+    if value == "MB2" then return input.UserInputType == Enum.UserInputType.MouseButton2 end
+    if value == "MB3" then return input.UserInputType == Enum.UserInputType.MouseButton3 end
+    local keyCode = Enum.KeyCode:FromName(value)
+    return keyCode ~= nil and input.KeyCode == keyCode
+end
+
+local function fireKey(keyCode)
+    VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+    task.wait()
+    VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+end
+local function keyDown(keyCode) VirtualInputManager:SendKeyEvent(true,  keyCode, false, game) end
+local function keyUp(keyCode)   VirtualInputManager:SendKeyEvent(false, keyCode, false, game) end
+local function clickDown() VirtualInputManager:SendMouseButtonEvent(0,0,0,true,  game, 1) end
+local function clickUp()   VirtualInputManager:SendMouseButtonEvent(0,0,0,false, game, 1) end
+local function clickMouse() clickDown(); task.wait(); clickUp() end
+local function waitMs(ms) task.wait(ms / 1000) end
+
+local BACKDASH_KEYS = { "Z","X","C","V" }
+
+local function copy(text)
+    if type(setclipboard) == "function" then setclipboard(text); return true end
+    return false
+end
+
+local function addGroup(tab, side, name, icon)
+    if tab.AddGroupbox then
+        local ok, box = pcall(function()
+            return tab:AddGroupbox({ Side = side, Name = name, IconName = icon })
+        end)
+        if ok and box then return box end
+    end
+    if side == "Left" then return tab:AddLeftGroupbox(name, icon) end
+    return tab:AddRightGroupbox(name, icon)
+end
+
+local function makeDraggable(frame, moveTarget)
+    moveTarget = moveTarget or frame
+    frame.Active = true
+    local dragging, dragStart, startPos = false, nil, nil
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = moveTarget.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    local changedConnection = connect(UserInputService.InputChanged, function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            local delta = input.Position - dragStart
+            moveTarget.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+    return function() changedConnection:Disconnect() end
+end
+
+-- ---------------------------------------------------------------------------
+-- UI build
+-- ---------------------------------------------------------------------------
+local function buildUI()
+
+local Window = Library:CreateWindow({
+    Title         = "Chillhub TSB",
+    Footer        = "by ilovemygfhehe123",
+    ToggleKeybind = Enum.KeyCode.RightBracket,
+    Center        = true,
+    AutoShow      = true,
+    Icon          = LOGO_ASSET_ID,
+})
+
+local _menuLastToggle = 0
+Library.ToggleCallback = function()
+    local now = os.clock()
+    if now - _menuLastToggle < 0.3 then return false end
+    _menuLastToggle = now
+    return true
+end
+
+local HomeTab      = Window:AddTab("Home",             "home")
+local VisualsTab   = Window:AddTab("Visuals",          "eye")
+local CombatTab    = Window:AddTab("Combat",           "swords")
+local MacrosTab    = Window:AddTab("Macros",           "keyboard")
+local UniversalTab = Window:AddTab("Universal",        "globe")
+local FunTab       = Window:AddTab("Fun",              "party-popper")
+local MusicTab     = Window:AddTab("Music",            "music")
+local LoaderTab    = Window:AddTab("Loader",           "download")
+local QoLTab       = Window:AddTab("Quality of Life",  "sparkles")
+local SettingsTab  = Window:AddTab("Settings",         "settings")
+
+-- ---------------------------------------------------------------------------
+-- HOME
+-- ---------------------------------------------------------------------------
+do
+    local HomeBox = addGroup(HomeTab, "Left", "Home Options", "home")
+    HomeBox:AddLabel("owner, ilovemygfhehe123 :3")
+    HomeBox:AddButton({ Text = "Join Discord", Func = function()
+        copy("Discord.gg/Nf8GNVYGF")
+        Library:Notify("Discord invite copied to your clipboard, go join!", 5)
+    end })
+    HomeBox:AddButton({ Text = "Youtube", Func = function()
+        copy("https://www.youtube.com/@Chillhubofficalchannel")
+        Library:Notify("Youtube link copied, now go subscribe!", 5)
+    end })
+    HomeBox:AddButton({ Text = "Tiktok", Func = function()
+        copy("https://www.tiktok.com/@justachillguywithagf")
+        Library:Notify("Tiktok link copied, now go follow!", 5)
+    end })
+    HomeBox:AddButton({ Text = "Roblox", Func = function()
+        copy("https://www.roblox.com/users/11725638566/profile")
+        Library:Notify("Come on now go follow me on roblox!", 5)
+    end })
+
+    local UpdateBox = addGroup(HomeTab, "Left", "Update " .. UPDATE_VERSION, "megaphone")
+    UpdateBox:AddLabel({ Text = UPDATE_NOTES, DoesWrap = true })
+
+    local KeysBox = addGroup(HomeTab, "Right", "Default Keybinds", "keyboard")
+    local function addKeybind(labelText, idx, default)
+        KeysBox:AddLabel(labelText):AddKeyPicker(idx, { Default = default, NoUI = true, Mode = "Toggle", Text = labelText })
+    end
+
+    KeysBox:AddLabel("Open / Close Menu"):AddKeyPicker("MenuKeybind", { Default = "RightBracket", NoUI = true, Text = "Open / Close Menu" })
+    Library.ToggleKeybind = Options.MenuKeybind
+
+    addKeybind("Fly Up",                        "Keybind_FlyUp",              "Space")
+    addKeybind("Fly Down",                      "Keybind_FlyDown",            "LeftControl")
+    for i = 1, 4 do
+        addKeybind("Backdash + " .. i,          "Macro_Backdash" .. i .. "_Key", BACKDASH_KEYS[i])
+    end
+    addKeybind("Super Jump",                    "Macro_SuperJump_Key",        "J")
+    addKeybind("Safezone (go / return)",        "Combat_Safezone_Key",        "N")
+    addKeybind("Game Dash Key (Faster Dashes)", "Keybind_GameDash",           "Q")
+    addKeybind("Lock-On (toggle)",              "LockOn_Key",                 "T")
+    addKeybind("Lock-On: Switch Target",        "LockOn_Switch",              "MB3")
+
+    local RejoinBox = addGroup(HomeTab, "Right", "Rejoin", "refresh-cw")
+    local function doRejoin()
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+        end)
+        if not ok then
+            warn("[Rejoin] same server failed:", err)
+            pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+        end
+    end
+    RejoinBox:AddToggle("AutoRejoin_Enabled", { Text = "Auto Rejoin", Default = false })
+    RejoinBox:AddSlider("AutoRejoin_Minutes", { Text = "Interval", Min = 1, Max = 60, Default = 19, Rounding = 0, Suffix = " min" })
+    RejoinBox:AddButton({ Text = "Rejoin Now", Func = doRejoin })
+    task.spawn(function()
+        local elapsed = 0
+        while not unloaded do
+            task.wait(1)
+            if Toggles.AutoRejoin_Enabled.Value then
+                elapsed += 1
+                if elapsed >= Options.AutoRejoin_Minutes.Value * 60 then
+                    elapsed = 0
+                    doRejoin()
+                end
+            else
+                elapsed = 0
+            end
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- VISUALS -- HUD
+-- ---------------------------------------------------------------------------
+do
+    local HudBox = addGroup(VisualsTab, "Left", "HUD (drag to move)", "monitor")
+
+    local hudGui = Instance.new("ScreenGui")
+    hudGui.Name = "ChillHUD"
+    hudGui.ResetOnSpawn = false
+    hudGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    onCleanup(function() hudGui:Destroy() end)
+
+    local entries = {}
+    local function makeHudLabel(text, y, width)
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.fromOffset(width, 26)
+        label.Position = UDim2.fromOffset(10, y)
+        label.BackgroundColor3 = Color3.new(0,0,0)
+        label.BackgroundTransparency = 0.4
+        label.TextColor3 = Color3.new(1,1,1)
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 16
+        label.Text = text
+        label.Visible = false
+        label.Parent = hudGui
+        local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0,6); corner.Parent = label
+        makeDraggable(label)
+        table.insert(entries, { label = label, width = width })
+        return label
+    end
+
+    local fpsLabel  = makeHudLabel("FPS: --",           10,  110)
+    local pingLabel = makeHudLabel("Ping: --",          42,  140)
+    local posLabel  = makeHudLabel("X: 0  Y: 0  Z: 0", 74,  220)
+
+    HudBox:AddToggle("FPS_Display",     { Text = "FPS Display",         Default = false, Callback = function(v) fpsLabel.Visible  = v end })
+    HudBox:AddToggle("Display_Ping",    { Text = "Ping Display",        Default = false, Callback = function(v) pingLabel.Visible = v end })
+    HudBox:AddToggle("HUD_Coordinates", { Text = "Coordinates Display", Default = false, Callback = function(v) posLabel.Visible  = v end })
+    HudBox:AddSlider("HUD_TextSize", { Text = "HUD Text Size", Min = 12, Max = 28, Default = 16, Rounding = 0, Callback = function(value)
+        for _, entry in entries do
+            entry.label.TextSize = value
+            entry.label.Size = UDim2.fromOffset(entry.width * (value / 16), value + 10)
+        end
+    end })
+    HudBox:AddLabel("HUD Text Color"):AddColorPicker("HUD_Color", { Default = Color3.new(1,1,1), Title = "HUD Text Color", Callback = function(color)
+        for _, entry in entries do entry.label.TextColor3 = color end
+    end })
+
+    local frames = 0; local elapsed = 0
+    connect(RunService.RenderStepped, function(dt)
+        if not fpsLabel.Visible then return end
+        frames += 1; elapsed += dt
+        if elapsed >= 0.5 then
+            fpsLabel.Text = "FPS: " .. math.round(frames / elapsed)
+            frames = 0; elapsed = 0
+        end
+    end)
+
+    local slowTimer = 0
+    connect(RunService.Heartbeat, function(dt)
+        slowTimer += dt
+        if slowTimer < 0.25 then return end
+        slowTimer = 0
+        if pingLabel.Visible then
+            local ok, ping = pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+            if ok then pingLabel.Text = "Ping: " .. math.floor(ping) .. " ms" end
+        end
+        if posLabel.Visible then
+            local root = getRoot()
+            if root then
+                local p = root.Position
+                posLabel.Text = ("X: %d  Y: %d  Z: %d"):format(math.floor(p.X), math.floor(p.Y), math.floor(p.Z))
+            end
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- VISUALS -- perf / lighting
+-- ---------------------------------------------------------------------------
+do
+    local PerfBox = addGroup(VisualsTab, "Left", "Performance & Visibility", "gauge")
+    local GREY_SKY_IMAGE = "rbxasset://textures/grey.png"
+    local originalGlobalShadows = Lighting.GlobalShadows
+    local originalSky  = Lighting:FindFirstChildOfClass("Sky")
+    local skyClone     = originalSky and originalSky:Clone()
+    local greySky      = nil
+    local lowQualityOn = false
+    local disabledEffects = {}; local disabledFx = {}
+
+    local function isFx(obj)
+        return (obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam")) and obj.Name ~= "ChillTrail"
+    end
+    local function disableFx(obj, record)
+        if obj.Enabled then
+            if record then disabledFx[obj] = true end
+            obj.Enabled = false
+        end
+    end
+    local function applyGreySky()
+        if not greySky then
+            greySky = Instance.new("Sky")
+            greySky.Name = "LowQualityGreySky"
+            for _, face in {"Bk","Dn","Ft","Lf","Rt","Up"} do greySky["Skybox"..face] = GREY_SKY_IMAGE end
+        end
+        local current = Lighting:FindFirstChildOfClass("Sky")
+        if current and current ~= greySky then current:Destroy() end
+        greySky.Parent = Lighting
+    end
+    local function setLowQuality(on)
+        lowQualityOn = on
+        if on then
+            Lighting.GlobalShadows = false
+            applyGreySky()
+        else
+            Lighting.GlobalShadows = originalGlobalShadows
+            if greySky then greySky.Parent = nil end
+            if skyClone and not Lighting:FindFirstChildOfClass("Sky") then skyClone:Clone().Parent = Lighting end
+        end
+        for _, effect in Lighting:GetChildren() do
+            if effect:IsA("PostEffect") then
+                if on then
+                    if effect.Enabled then disabledEffects[effect] = true; effect.Enabled = false end
+                elseif disabledEffects[effect] then
+                    effect.Enabled = true; disabledEffects[effect] = nil
+                end
+            end
+        end
+        for _, obj in workspace:GetDescendants() do
+            if isFx(obj) then
+                if on then disableFx(obj, true)
+                elseif disabledFx[obj] then obj.Enabled = true; disabledFx[obj] = nil end
+            end
+        end
+    end
+    connect(workspace.DescendantAdded, function(obj)
+        if lowQualityOn and isFx(obj) then task.defer(disableFx, obj, false) end
+    end)
+
+    PerfBox:AddToggle("LowQuality_Enabled", { Text = "Low Quality", Default = false, Callback = setLowQuality })
+
+    local savedLighting = nil
+    PerfBox:AddToggle("Fullbright_Enabled", { Text = "Fullbright", Default = false, Callback = function(on)
+        if on then
+            savedLighting = {
+                Brightness = Lighting.Brightness,
+                ClockTime = Lighting.ClockTime,
+                Ambient = Lighting.Ambient,
+                OutdoorAmbient = Lighting.OutdoorAmbient,
+                FogEnd = Lighting.FogEnd,
+                GlobalShadows = Lighting.GlobalShadows,
+            }
+            Lighting.Brightness = 2
+            Lighting.ClockTime = 14
+            Lighting.Ambient = Color3.new(1,1,1)
+            Lighting.OutdoorAmbient = Color3.new(1,1,1)
+            Lighting.FogEnd = 100000
+            Lighting.GlobalShadows = false
+        elseif savedLighting then
+            for prop, value in savedLighting do Lighting[prop] = value end
+            savedLighting = nil
+        end
+    end })
+
+    PerfBox:AddToggle("FOV_Enabled", { Text = "Custom FOV", Default = false })
+    PerfBox:AddSlider("FOV_Value",   { Text = "FOV", Min = 70, Max = 120, Default = 80, Rounding = 0 })
+    connect(RunService.RenderStepped, function()
+        if not Toggles.FOV_Enabled.Value then return end
+        local camera = workspace.CurrentCamera
+        local fov = Options.FOV_Value.Value
+        if camera and camera.FieldOfView ~= fov then camera.FieldOfView = fov end
+    end)
+
+    local ExtremeBox = addGroup(VisualsTab, "Left", "Extreme Low Quality", "zap")
+    local GREY_MATERIAL_COLOR = Color3.fromRGB(140,140,140)
+    local extremeApplied = false
+    local function applyExtremeLowQuality()
+        if extremeApplied then return end
+        extremeApplied = true
+        applyGreySky()
+        -- Lighting.Technology is read-only at runtime; skip the assignment attempt
+        Lighting.GlobalShadows = false
+        for _, obj in workspace:GetDescendants() do
+            pcall(function()
+                if obj:IsA("BasePart") then
+                    obj.Material = Enum.Material.SmoothPlastic
+                    obj.Color = GREY_MATERIAL_COLOR
+                    obj.Reflectance = 0
+                elseif obj:IsA("Decal") or obj:IsA("Texture") then
+                    obj.Transparency = 1
+                elseif obj:IsA("SpecialMesh") then
+                    obj.TextureId = ""
+                elseif obj:IsA("SurfaceAppearance") then
+                    obj.Parent = nil
+                elseif isFx(obj) then
+                    obj.Enabled = false
+                end
+            end)
+        end
+        if type(setfflag) == "function" then pcall(function() setfflag("FIntDebugTextureManagerSkipMips","8") end) end
+    end
+
+    local BOOST_GREY = Color3.fromRGB(85,85,85)
+    local boostApplied = false
+    local function inCharacter(obj)
+        local model = obj:FindFirstAncestorWhichIsA("Model")
+        while model do
+            if model:FindFirstChildOfClass("Humanoid") then return true end
+            model = model:FindFirstAncestorWhichIsA("Model")
+        end
+        return false
+    end
+    local function stripEffect(obj)
+        if obj:IsA("ParticleEmitter") or obj:IsA("Smoke") or obj:IsA("Fire") or obj:IsA("Sparkles") then obj:Destroy(); return true
+        elseif (obj:IsA("Trail") or obj:IsA("Beam")) and obj.Name ~= "ChillTrail" then obj.Enabled = false; return true
+        elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then obj.Enabled = false; return true end
+        return false
+    end
+    local function boostMapObject(obj)
+        if obj:IsA("Terrain") then return end
+        if obj:IsA("BasePart") then
+            obj.Material = Enum.Material.SmoothPlastic
+            obj.Reflectance = 0
+            obj.CastShadow = false
+            obj.Color = BOOST_GREY
+            if obj:IsA("MeshPart") then
+                obj.TextureID = ""
+                obj.RenderFidelity = Enum.RenderFidelity.Performance
+            end
+            if (obj:IsA("MeshPart") or obj:IsA("UnionOperation")) and obj.Anchored and obj.Size.Magnitude < 60 then
+                obj.LocalTransparencyModifier = 1
+            end
+        elseif obj:IsA("Decal") or obj:IsA("Texture") or obj:IsA("SurfaceAppearance") then
+            obj:Destroy()
+        elseif obj:IsA("SpecialMesh") then
+            obj.TextureId = ""
+        end
+    end
+    local function applyMassiveBoost()
+        if boostApplied then Library:Notify("Massive FPS Boost is already applied", 4); return end
+        boostApplied = true
+        pcall(function() Lighting.GlobalShadows = false end)
+        for _, child in Lighting:GetChildren() do
+            if child:IsA("PostEffect") or child:IsA("Atmosphere") then pcall(function() child:Destroy() end) end
+        end
+        pcall(function()
+            local terrain = workspace:FindFirstChildOfClass("Terrain")
+            if terrain then
+                terrain.Decoration = false
+                terrain.WaterWaveSize = 0
+                terrain.WaterWaveSpeed = 0
+                terrain.WaterReflectance = 0
+                terrain.WaterTransparency = 0
+                local clouds = terrain:FindFirstChildOfClass("Clouds")
+                if clouds then clouds:Destroy() end
+            end
+        end)
+        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+        if type(setfflag) == "function" then pcall(function() setfflag("FIntDebugTextureManagerSkipMips","8") end) end
+        local count = 0
+        for _, obj in workspace:GetDescendants() do
+            pcall(function()
+                if not stripEffect(obj) and not inCharacter(obj) then boostMapObject(obj) end
+            end)
+            count += 1
+            if count % 1500 == 0 then task.wait() end
+        end
+        Library:Notify("Massive FPS Boost applied, rejoin to undo.", 6)
+    end
+    connect(workspace.DescendantAdded, function(obj)
+        if not boostApplied then return end
+        task.defer(function()
+            pcall(function()
+                if not stripEffect(obj) then
+                    if (obj:IsA("Decal") or obj:IsA("Texture") or obj:IsA("SurfaceAppearance")) and not inCharacter(obj) then
+                        obj:Destroy()
+                    end
+                end
+            end)
+        end)
+    end)
+
+    local extremeButton = ExtremeBox:AddButton({ Text = "Extreme Low Quality", Func = function()
+        Library:Notify("Drastic visual change incoming, rejoin to undo. Applying in 4s...", 5)
+        task.delay(4, function()
+            if unloaded then return end
+            applyExtremeLowQuality()
+            Library:Notify("Extreme Low Quality applied. Rejoin to undo.", 5)
+        end)
+    end })
+    extremeButton:AddButton({ Text = "Massive FPS Boost", Func = function()
+        Library:Notify("Applying Massive FPS Boost, this may freeze for a second...", 4)
+        task.spawn(applyMassiveBoost)
+    end })
+end
+
+-- ---------------------------------------------------------------------------
+-- VISUALS -- ESP
+-- ---------------------------------------------------------------------------
+do
+    local ESPBox = addGroup(VisualsTab, "Right", "Player ESP", "eye")
+    ESPBox:AddToggle("ESP_Enabled", { Text = "Player ESP", Default = true })
+    local fillToggle    = ESPBox:AddToggle("ESP_Fill_Enabled",    { Text = "ESP Fill",    Default = true })
+    fillToggle:AddColorPicker("ESP_Fill_Color",    { Default = Color3.fromRGB(0,170,255), Title = "ESP Fill Color" })
+    local outlineToggle = ESPBox:AddToggle("ESP_Outline_Enabled", { Text = "ESP Outline", Default = true })
+    outlineToggle:AddColorPicker("ESP_Outline_Color", { Default = Color3.fromRGB(0,170,255), Title = "ESP Outline Color" })
+    ESPBox:AddToggle("ESP_HealthColor", { Text = "Color By Health", Default = false, Tooltip = "Fill and outline go from green to red by health." })
+    local tracerToggle  = ESPBox:AddToggle("ESP_Tracers_Enabled", { Text = "ESP Tracers", Default = false, Callback = function(value)
+        if value and type(Drawing) ~= "table" then Library:Notify("Your executor doesn't support the Drawing library", 5) end
+    end })
+    tracerToggle:AddColorPicker("ESP_Tracers_Color", { Default = Color3.fromRGB(255,255,255), Title = "ESP Tracers Color" })
+
+    local InfoBox = addGroup(VisualsTab, "Right", "Info ESP", "info")
+    InfoBox:AddToggle("ESP_Names",    { Text = "Names",    Default = false })
+    InfoBox:AddToggle("ESP_Health",   { Text = "Health",   Default = false })
+    InfoBox:AddToggle("ESP_Distance", { Text = "Distance", Default = false })
+    local skeletonToggle = InfoBox:AddToggle("ESP_Skeleton", { Text = "Skeleton (R6 + R15)", Default = false, Tooltip = "Draws a bone skeleton over each player. Works on both R6 and R15 rigs." })
+    skeletonToggle:AddColorPicker("ESP_Skeleton_Color", { Default = Color3.fromRGB(230, 230, 210), Title = "Skeleton Color" })
+
+    local espHighlights = {}; local infoBoards = {}; local skeletonLines = {}
+
+    local SKELETON_JOINTS_R15 = {
+        {"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
+        {"UpperTorso","LeftUpperArm"},{"LeftUpperArm","LeftLowerArm"},{"LeftLowerArm","LeftHand"},
+        {"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},
+        {"LowerTorso","LeftUpperLeg"},{"LeftUpperLeg","LeftLowerLeg"},{"LeftLowerLeg","LeftFoot"},
+        {"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"},
+    }
+    local SKELETON_JOINTS_R6 = {
+        {"Head","Torso"},{"Torso","Left Arm"},{"Left Arm","Left Hand"},
+        {"Torso","Right Arm"},{"Right Arm","Right Hand"},
+        {"Torso","Left Leg"},{"Left Leg","Left Foot"},
+        {"Torso","Right Leg"},{"Right Leg","Right Foot"},
+        {"HumanoidRootPart","Torso"},
+    }
+    local BONE_THICKNESS = 2.5
+    local function getBoneColor()
+        return Options.ESP_Skeleton_Color and Options.ESP_Skeleton_Color.Value or Color3.fromRGB(230,230,210)
+    end
+
+    local function getSkeletonJoints(character)
+        if character:FindFirstChild("UpperTorso") then return SKELETON_JOINTS_R15 end
+        return SKELETON_JOINTS_R6
+    end
+
+    local function removeHighlight(plr) local h=espHighlights[plr]; if h then h:Destroy(); espHighlights[plr]=nil end end
+    local function removeInfo(plr) local board=infoBoards[plr]; if board then board.gui:Destroy(); infoBoards[plr]=nil end end
+    local function removeSkeleton(plr)
+        local lines=skeletonLines[plr]
+        if lines then
+            for _,line in lines do pcall(function() line:Remove() end) end
+            skeletonLines[plr]=nil
+        end
+    end
+
+    local function updateHighlight(plr)
+        local character=plr.Character
+        if plr==LocalPlayer or not Toggles.ESP_Enabled.Value or not character then removeHighlight(plr); return end
+        local humanoid=character:FindFirstChildOfClass("Humanoid")
+        if not humanoid then removeHighlight(plr); return end
+        local h=espHighlights[plr]
+        if not h or not h.Parent or h.Adornee~=character then
+            if h then h:Destroy() end
+            h=Instance.new("Highlight")
+            h.Name="ChillESPHighlight"
+            h.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+            h.Adornee=character
+            h.Parent=character
+            espHighlights[plr]=h
+        end
+        local fillColor=Options.ESP_Fill_Color.Value
+        local outlineColor=Options.ESP_Outline_Color.Value
+        if Toggles.ESP_HealthColor.Value and humanoid.MaxHealth>0 then
+            local healthRatio=math.clamp(humanoid.Health/humanoid.MaxHealth,0,1)
+            fillColor=Color3.fromHSV(healthRatio*0.33,1,1)
+            outlineColor=fillColor
+        end
+        h.FillColor=fillColor
+        h.FillTransparency=Toggles.ESP_Fill_Enabled.Value and 0.75 or 1
+        h.OutlineColor=outlineColor
+        h.OutlineTransparency=Toggles.ESP_Outline_Enabled.Value and 0 or 1
+    end
+
+    local function updateInfo(plr)
+        local character=plr.Character
+        local head=character and character:FindFirstChild("Head")
+        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+        local wantName=Toggles.ESP_Names.Value
+        local wantHealth=Toggles.ESP_Health.Value
+        local wantDistance=Toggles.ESP_Distance.Value
+        if plr==LocalPlayer or not head or not humanoid or not (wantName or wantHealth or wantDistance) then
+            removeInfo(plr); return
+        end
+        local board=infoBoards[plr]
+        if not board or not board.gui.Parent or board.gui.Adornee~=head then
+            if board then board.gui:Destroy() end
+            local gui=Instance.new("BillboardGui")
+            gui.Name="ChillInfoESP"
+            gui.Size=UDim2.fromOffset(180,60)
+            gui.StudsOffset=Vector3.new(0,3,0)
+            gui.AlwaysOnTop=true
+            gui.Adornee=head
+            gui.Parent=head
+            local label=Instance.new("TextLabel")
+            label.Size=UDim2.fromScale(1,1)
+            label.BackgroundTransparency=1
+            label.TextColor3=Color3.new(1,1,1)
+            label.TextStrokeTransparency=0
+            label.Font=Enum.Font.GothamBold
+            label.TextSize=13
+            label.Parent=gui
+            board={gui=gui,label=label}
+            infoBoards[plr]=board
+        end
+        local lines={}
+        if wantName then table.insert(lines,plr.DisplayName) end
+        if wantHealth then
+            table.insert(lines,("HP: %d / %d"):format(math.floor(humanoid.Health),math.floor(humanoid.MaxHealth)))
+        end
+        if wantDistance then
+            local myRoot=getRoot()
+            if myRoot then
+                table.insert(lines,("%d studs"):format(math.floor((myRoot.Position-head.Position).Magnitude)))
+            end
+        end
+        board.label.Text=table.concat(lines,"\n")
+    end
+
+    local drawingSupported=type(Drawing)=="table"
+
+    local function updateSkeleton(plr,camera)
+        if not drawingSupported then return end
+        local character=plr.Character
+        if plr==LocalPlayer or not Toggles.ESP_Skeleton.Value or not character or not Toggles.ESP_Enabled.Value then
+            removeSkeleton(plr); return
+        end
+        local joints=getSkeletonJoints(character)
+        local lines=skeletonLines[plr]
+        if not lines or #lines~=#joints then
+            if lines then for _,l in lines do pcall(function() l:Remove() end) end end
+            lines={}
+            for i=1,#joints do
+                local ok,line=pcall(function()
+                    local l=Drawing.new("Line")
+                    l.Thickness=BONE_THICKNESS
+                    l.Transparency=1
+                    l.Color=getBoneColor()
+                    l.Visible=false
+                    return l
+                end)
+                if ok then lines[i]=line end
+            end
+            skeletonLines[plr]=lines
+        end
+        for i,pair in joints do
+            local line=lines[i]
+            if line then
+                local partA=character:FindFirstChild(pair[1])
+                local partB=character:FindFirstChild(pair[2])
+                if partA and partB then
+                    local posA,onA=camera:WorldToViewportPoint(partA.Position)
+                    local posB,onB=camera:WorldToViewportPoint(partB.Position)
+                    if onA or onB then
+                        line.From=Vector2.new(posA.X,posA.Y)
+                        line.To=Vector2.new(posB.X,posB.Y)
+                        line.Color=getBoneColor()
+                        line.Visible=true
+                    else
+                        line.Visible=false
+                    end
+                else
+                    line.Visible=false
+                end
+            end
+        end
+    end
+
+    local function hookPlayer(plr)
+        if plr==LocalPlayer then return end
+        if plr.Character then
+            task.spawn(function()
+                task.wait(0.5)
+                pcall(function() updateHighlight(plr) end)
+            end)
+        end
+        connect(plr.CharacterAdded,function()
+            task.wait(0.5)
+            pcall(function() updateHighlight(plr) end)
+        end)
+    end
+
+    for _,plr in Players:GetPlayers() do hookPlayer(plr) end
+    connect(Players.PlayerAdded,hookPlayer)
+    connect(Players.PlayerRemoving,function(plr)
+        removeHighlight(plr); removeInfo(plr); removeSkeleton(plr)
+    end)
+
+    task.spawn(function()
+        while not unloaded do
+            for _,plr in Players:GetPlayers() do
+                if plr~=LocalPlayer then
+                    pcall(function() updateHighlight(plr); updateInfo(plr) end)
+                end
+            end
+            task.wait(0.25)
+        end
+    end)
+
+    onCleanup(function()
+        for plr in espHighlights do removeHighlight(plr) end
+        for plr in infoBoards do removeInfo(plr) end
+        for plr in skeletonLines do removeSkeleton(plr) end
+    end)
+
+    local tracerLines={}
+    local function hideTracers() for _,line in tracerLines do line.Visible=false end end
+    connect(RunService.RenderStepped,function()
+        if not drawingSupported then return end
+        local camera=workspace.CurrentCamera
+        if not camera then return end
+        if Toggles.ESP_Skeleton.Value then
+            for _,plr in Players:GetPlayers() do
+                if plr~=LocalPlayer then pcall(function() updateSkeleton(plr,camera) end) end
+            end
+        else
+            for plr in skeletonLines do removeSkeleton(plr) end
+        end
+        if not Toggles.ESP_Tracers_Enabled.Value then hideTracers(); return end
+        local origin=nil
+        local myRoot=getRoot()
+        if myRoot then
+            local p,onScreen=camera:WorldToViewportPoint(myRoot.Position)
+            if onScreen then origin=Vector2.new(p.X,p.Y) end
+        end
+        if not origin then
+            local viewport=camera.ViewportSize
+            origin=Vector2.new(viewport.X/2,viewport.Y/2)
+        end
+        local color=Options.ESP_Tracers_Color.Value
+        for _,plr in Players:GetPlayers() do
+            if plr~=LocalPlayer then
+                local character=plr.Character
+                local targetPart=character and (character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head"))
+                local line=tracerLines[plr]
+                local visible=false
+                if targetPart then
+                    local pos,onScreen=camera:WorldToViewportPoint(targetPart.Position)
+                    if onScreen then
+                        if not line then
+                            local ok,newLine=pcall(function()
+                                local l=Drawing.new("Line")
+                                l.Thickness=1
+                                l.Transparency=1
+                                return l
+                            end)
+                            if ok then line=newLine; tracerLines[plr]=line end
+                        end
+                        if line then
+                            line.From=origin
+                            line.To=Vector2.new(pos.X,pos.Y)
+                            line.Color=color
+                            line.Visible=true
+                            visible=true
+                        end
+                    end
+                end
+                if line and not visible then line.Visible=false end
+            end
+        end
+    end)
+    connect(Players.PlayerRemoving,function(plr)
+        local line=tracerLines[plr]
+        if line then pcall(function() line:Remove() end); tracerLines[plr]=nil end
+    end)
+    onCleanup(function()
+        for plr,line in tracerLines do pcall(function() line:Remove() end); tracerLines[plr]=nil end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- VISUALS -- avatar / world / crosshair
+-- ---------------------------------------------------------------------------
+do
+    local AvatarBox = addGroup(VisualsTab, "Left", "Avatar", "user")
+    local HEADLESS_ASSET_ID = 134082579
+    local function getHumanoidOrWarn()
+        local humanoid=getHumanoid()
+        if not humanoid then Library:Notify("No character found",4) end
+        return humanoid
+    end
+    local function applyDescriptionAsset(humanoid,field,assetId,label)
+        local ok=pcall(function()
+            local description=humanoid:GetAppliedDescription()
+            description[field]=assetId
+            humanoid:ApplyDescription(description)
+        end)
+        if ok then
+            Library:Notify(label.." applied",3)
+        else
+            Library:Notify("Couldn't apply "..label..". This game blocks avatar changes from the client on R15.",6)
+        end
+    end
+    local function applyHeadless()
+        local humanoid=getHumanoidOrWarn()
+        if not humanoid then return end
+        if humanoid.RigType==Enum.HumanoidRigType.R15 then
+            applyDescriptionAsset(humanoid,"Head",HEADLESS_ASSET_ID,"Headless"); return
+        end
+        local head=humanoid.Parent and humanoid.Parent:FindFirstChild("Head")
+        if not head then return end
+        local specialMesh=head:FindFirstChildOfClass("SpecialMesh")
+        if specialMesh then specialMesh.MeshId=""; specialMesh.TextureId="" end
+        for _,child in head:GetChildren() do
+            if child:IsA("Decal") then child:Destroy() end
+        end
+        head.Transparency=1
+        Library:Notify("Headless applied",3)
+    end
+    AvatarBox:AddButton({ Text="Headless", Func=function() task.spawn(applyHeadless) end })
+    AvatarBox:AddLabel({ Text="R6 avatars use CharacterMesh. R15 avatars need the game to allow avatar changes from your client. Rejoin to undo Headless.", DoesWrap=true })
+end
+
+do
+    local WorldBox = addGroup(VisualsTab, "Left", "World & Camera", "globe")
+    local xrayOn=false
+    local xrayGen=0
+    local xrayParts={}
+    local function belongsToCharacter(obj)
+        local model=obj:FindFirstAncestorWhichIsA("Model")
+        while model do
+            if model:FindFirstChildOfClass("Humanoid") then return true end
+            model=model:FindFirstAncestorWhichIsA("Model")
+        end
+        return false
+    end
+    local function xrayValue()
+        local opt=Options.XRay_Transparency
+        return ((opt and opt.Value) or 60)/100
+    end
+    local function applyXray(obj,value)
+        if obj:IsA("BasePart") and not obj:IsA("Terrain") and not belongsToCharacter(obj) then
+            if xrayParts[obj]==nil then xrayParts[obj]=obj.LocalTransparencyModifier end
+            obj.LocalTransparencyModifier=value
+        end
+    end
+    local function restoreXray()
+        for part,original in xrayParts do
+            if part.Parent then part.LocalTransparencyModifier=original end
+            xrayParts[part]=nil
+        end
+    end
+    local function refreshXray()
+        xrayGen+=1
+        local gen=xrayGen
+        if not xrayOn then restoreXray(); return end
+        local value=xrayValue()
+        for part in xrayParts do
+            if part.Parent then part.LocalTransparencyModifier=value else xrayParts[part]=nil end
+        end
+        local count=0
+        for _,obj in workspace:GetDescendants() do
+            if gen~=xrayGen then return end
+            applyXray(obj,value)
+            count+=1
+            if count%1500==0 then task.wait() end
+        end
+    end
+    connect(workspace.DescendantAdded,function(obj)
+        if not xrayOn then return end
+        task.defer(function() if xrayOn then applyXray(obj,xrayValue()) end end)
+    end)
+    WorldBox:AddToggle("XRay_Enabled",      { Text="X-Ray", Default=false, Callback=function(value) xrayOn=value; task.spawn(refreshXray) end })
+    WorldBox:AddSlider("XRay_Transparency", { Text="X-Ray Transparency", Min=10, Max=95, Default=60, Rounding=0, Suffix="%", Callback=function() if xrayOn then task.spawn(refreshXray) end end })
+    onCleanup(function() xrayOn=false; refreshXray() end)
+
+    local defaultMaxZoom=LocalPlayer.CameraMaxZoomDistance
+    local defaultMinZoom=LocalPlayer.CameraMinZoomDistance
+    WorldBox:AddToggle("Camera_UnlockZoom", { Text="Unlock Camera Zoom", Default=false, Callback=function(value)
+        if value then
+            LocalPlayer.CameraMaxZoomDistance=10000
+            LocalPlayer.CameraMinZoomDistance=0.5
+        else
+            LocalPlayer.CameraMaxZoomDistance=defaultMaxZoom
+            LocalPlayer.CameraMinZoomDistance=defaultMinZoom
+        end
+    end })
+
+    local CrosshairBox = addGroup(VisualsTab, "Right", "Crosshair", "crosshair")
+    local crosshairToggle=CrosshairBox:AddToggle("Crosshair_Enabled",{ Text="Custom Crosshair", Default=false })
+    crosshairToggle:AddColorPicker("Crosshair_Color",{ Default=Color3.fromRGB(0,255,120), Title="Crosshair Color" })
+    CrosshairBox:AddSlider("Crosshair_Size",      { Text="Size",      Min=2,  Max=30, Default=8,  Rounding=0 })
+    CrosshairBox:AddSlider("Crosshair_Gap",       { Text="Gap",       Min=0,  Max=20, Default=3,  Rounding=0 })
+    CrosshairBox:AddSlider("Crosshair_Thickness", { Text="Thickness", Min=1,  Max=5,  Default=1,  Rounding=0 })
+    local crosshairLines={}
+    if type(Drawing)=="table" then
+        for i=1,4 do
+            local ok,line=pcall(function()
+                local l=Drawing.new("Line")
+                l.Transparency=1
+                l.Visible=false
+                return l
+            end)
+            if ok then crosshairLines[i]=line end
+        end
+    end
+    connect(RunService.RenderStepped,function()
+        local camera=workspace.CurrentCamera
+        local show=Toggles.Crosshair_Enabled.Value and camera~=nil
+        for _,line in pairs(crosshairLines) do line.Visible=show end
+        if not show then return end
+        local size=Options.Crosshair_Size.Value
+        local gap=Options.Crosshair_Gap.Value
+        local thickness=Options.Crosshair_Thickness.Value
+        local color=Options.Crosshair_Color.Value
+        local center=camera.ViewportSize/2
+        local cx=center.X; local cy=center.Y
+        local segments={
+            {Vector2.new(cx-gap-size,cy),Vector2.new(cx-gap,cy)},
+            {Vector2.new(cx+gap,cy),Vector2.new(cx+gap+size,cy)},
+            {Vector2.new(cx,cy-gap-size),Vector2.new(cx,cy-gap)},
+            {Vector2.new(cx,cy+gap),Vector2.new(cx,cy+gap+size)},
+        }
+        for i,segment in segments do
+            local line=crosshairLines[i]
+            if line then
+                line.From=segment[1]
+                line.To=segment[2]
+                line.Color=color
+                line.Thickness=thickness
+            end
+        end
+    end)
+    onCleanup(function()
+        for i,line in pairs(crosshairLines) do pcall(function() line:Remove() end); crosshairLines[i]=nil end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- COMBAT -- safezone, dashes, lock-on, fling, extras
+-- ---------------------------------------------------------------------------
+do
+    local SafeBox=addGroup(CombatTab,"Left","Auto Safezone","shield")
+    local SafeControls=addGroup(CombatTab,"Right","Safezone Controls","navigation")
+    SafeBox:AddToggle("Combat_Safezone_Enabled",{ Text="Auto Safezone", Default=false, Tooltip="When your health drops to the trigger level you get teleported up to a sky platform." })
+    SafeBox:AddSlider("Combat_Safezone_Health", { Text="Trigger At Health",  Min=5,   Max=95,   Default=50,  Rounding=0, Suffix="%" })
+    SafeBox:AddSlider("Combat_Safezone_Height", { Text="Safezone Height",    Min=100, Max=3000, Default=500, Rounding=0, Suffix=" studs" })
+    SafeBox:AddSlider("Combat_Safezone_Size",   { Text="Platform Size",      Min=60,  Max=800,  Default=400, Rounding=0, Suffix=" studs" })
+    SafeBox:AddToggle("Combat_Safezone_Walls",  { Text="Edge Walls", Default=true, Tooltip="Faint walls so you can't fall off." })
+    SafeBox:AddSlider("Combat_Safezone_ReturnTime",{ Text="Auto Return After (0 = stay)", Min=0, Max=120, Default=0, Rounding=0, Suffix="s" })
+
+    local PLATFORM_THICKNESS=4
+    local WALL_HEIGHT=60
+    local safezone=nil
+    local lastHealth=nil
+    local healthConn=nil
+
+    local function makePart(container,name,size,cframe,transparency)
+        local part=Instance.new("Part")
+        part.Name=name
+        part.Anchored=true
+        part.CanCollide=true
+        part.CastShadow=false
+        part.Material=Enum.Material.ForceField
+        part.Color=ACCENT
+        part.Transparency=transparency
+        part.Size=size
+        part.CFrame=cframe
+        part.Parent=container
+        return part
+    end
+    local function destroySafezone()
+        if safezone then
+            local data=safezone
+            safezone=nil
+            if data.container then data.container:Destroy() end
+        end
+    end
+    local function leaveSafezone()
+        if not safezone then return end
+        local data=safezone
+        destroySafezone()
+        local root=getRoot()
+        if root and data.returnCFrame then
+            root.AssemblyLinearVelocity=Vector3.zero
+            root.CFrame=data.returnCFrame
+        end
+    end
+    local function enterSafezone()
+        if safezone then return end
+        local root=getRoot()
+        if not root then return end
+        local returnCFrame=root.CFrame
+        local size=Options.Combat_Safezone_Size.Value
+        local center=returnCFrame.Position+Vector3.new(0,Options.Combat_Safezone_Height.Value,0)
+        local container=Instance.new("Folder")
+        container.Name="ChillSafezone"
+        makePart(container,"Platform",Vector3.new(size,PLATFORM_THICKNESS,size),CFrame.new(center),0.5)
+        if Toggles.Combat_Safezone_Walls.Value then
+            local half=size/2
+            local wallCenter=center+Vector3.new(0,PLATFORM_THICKNESS/2+WALL_HEIGHT/2,0)
+            makePart(container,"WallN",Vector3.new(size,WALL_HEIGHT,2),CFrame.new(wallCenter+Vector3.new(0,0,half)),0.9)
+            makePart(container,"WallS",Vector3.new(size,WALL_HEIGHT,2),CFrame.new(wallCenter-Vector3.new(0,0,half)),0.9)
+            makePart(container,"WallE",Vector3.new(2,WALL_HEIGHT,size),CFrame.new(wallCenter+Vector3.new(half,0,0)),0.9)
+            makePart(container,"WallW",Vector3.new(2,WALL_HEIGHT,size),CFrame.new(wallCenter-Vector3.new(half,0,0)),0.9)
+        end
+        container.Parent=workspace
+        local data={container=container,center=center,size=size,returnCFrame=returnCFrame}
+        safezone=data
+        root.AssemblyLinearVelocity=Vector3.zero
+        root.CFrame=CFrame.new(center+Vector3.new(0,PLATFORM_THICKNESS/2+4,0))
+        Library:Notify("Safezone activated",3)
+        local delaySeconds=Options.Combat_Safezone_ReturnTime.Value
+        if delaySeconds>0 then
+            task.delay(delaySeconds,function() if safezone==data then leaveSafezone() end end)
+        end
+    end
+
+    connect(RunService.Heartbeat,function()
+        local data=safezone
+        if not data then return end
+        local root=getRoot()
+        if not root then return end
+        local rel=root.Position-data.center
+        local limit=data.size/2+4
+        if rel.Y<-8 or math.abs(rel.X)>limit or math.abs(rel.Z)>limit then
+            root.AssemblyLinearVelocity=Vector3.zero
+            root.CFrame=CFrame.new(data.center+Vector3.new(0,PLATFORM_THICKNESS/2+4,0))
+        end
+    end)
+
+    local function watchCharacter(character)
+        local humanoid=character:WaitForChild("Humanoid",10)
+        if not humanoid then return end
+        if healthConn then healthConn:Disconnect() end
+        lastHealth=humanoid.Health
+        healthConn=humanoid.HealthChanged:Connect(function(health)
+            local tookDamage=lastHealth~=nil and health<lastHealth
+            lastHealth=health
+            if not tookDamage or health<=0 then return end
+            if not Toggles.Combat_Safezone_Enabled.Value or safezone then return end
+            local triggerAt=humanoid.MaxHealth*(Options.Combat_Safezone_Health.Value/100)
+            if health<=triggerAt then enterSafezone() end
+        end)
+    end
+
+    SafeControls:AddButton({ Text="Go To Safezone Now", Func=enterSafezone })
+    SafeControls:AddButton({ Text="Return To Ground",    Func=leaveSafezone })
+    SafeControls:AddLabel({ Text="Safezone key is set in the Home tab (default N).", DoesWrap=true })
+
+    connect(UserInputService.InputBegan,function(input,processed)
+        if processed then return end
+        local key=keyFromOption("Combat_Safezone_Key")
+        if key and input.KeyCode==key then
+            if safezone then leaveSafezone() else enterSafezone() end
+        end
+    end)
+    connect(LocalPlayer.CharacterAdded,function(character) destroySafezone(); watchCharacter(character) end)
+    if LocalPlayer.Character then task.spawn(watchCharacter,LocalPlayer.Character) end
+    onCleanup(function()
+        if healthConn then healthConn:Disconnect(); healthConn=nil end
+        destroySafezone()
+    end)
+end
+
+do
+    local DashBox  = addGroup(CombatTab,"Left","Faster Dashes","move-horizontal")
+    local LockBox  = addGroup(CombatTab,"Right","Lock-On","locate-fixed")
+    local FlingBox = addGroup(CombatTab,"Left","Fling Tool","tornado")
+
+    DashBox:AddToggle("Dash_Enabled", { Text="Faster Dashes", Default=false, Tooltip="Adds extra speed on top of the game's dash. Uses the dash key set in Home (default Q)." })
+
+    DashBox:AddInput("Dash_SideBoost",  { Text="Side Boost (studs/s)",  Default="40",  Numeric=true, Finished=false, Placeholder="0-300" })
+    DashBox:AddInput("Dash_FrontBoost", { Text="Front Boost (studs/s)", Default="25",  Numeric=true, Finished=false, Placeholder="0-300" })
+    DashBox:AddInput("Dash_BackBoost",  { Text="Back Boost (studs/s)",  Default="25",  Numeric=true, Finished=false, Placeholder="0-300" })
+    DashBox:AddInput("Dash_Duration",   { Text="Boost Duration (ms)",   Default="250", Numeric=true, Finished=false, Placeholder="50-2000" })
+
+    DashBox:AddToggle("Dash_Tracker", { Text="Dash Cooldown Tracker (drag to move)", Default=false, Callback=function(value) Shared.setTrackerVisible(value) end })
+    DashBox:AddLabel({ Text="Front dashes keep following your camera while boosted. Very high boosts can rubberband you so start low.", DoesWrap=true })
+
+    local SIDE_COOLDOWN=2
+    local FRONT_BACK_COOLDOWN=5
+    local cooldowns={side=0,frontBack=0}
+    local dashing=nil
+
+    local trackerGui=Instance.new("ScreenGui")
+    trackerGui.Name="ChillDashTracker"
+    trackerGui.ResetOnSpawn=false
+    trackerGui.Enabled=false
+    trackerGui.Parent=LocalPlayer:WaitForChild("PlayerGui")
+
+    local trackerLabel=Instance.new("TextLabel")
+    trackerLabel.Size=UDim2.fromOffset(190,46)
+    trackerLabel.Position=UDim2.fromOffset(10,110)
+    trackerLabel.BackgroundColor3=Color3.new(0,0,0)
+    trackerLabel.BackgroundTransparency=0.4
+    trackerLabel.TextColor3=Color3.new(1,1,1)
+    trackerLabel.Font=Enum.Font.GothamBold
+    trackerLabel.TextSize=14
+    trackerLabel.RichText=true
+    trackerLabel.Parent=trackerGui
+
+    local trackerCorner=Instance.new("UICorner"); trackerCorner.CornerRadius=UDim.new(0,6); trackerCorner.Parent=trackerLabel
+    makeDraggable(trackerLabel)
+    Shared.setTrackerVisible=function(value) trackerGui.Enabled=value end
+    onCleanup(function() Shared.setTrackerVisible=function() end; trackerGui:Destroy() end)
+
+    local function cooldownText(label,readyAt)
+        local remaining=readyAt-os.clock()
+        if remaining<=0 then return label..': <font color="rgb(120,255,140)">READY</font>' end
+        return label..': <font color="rgb(255,120,120)">'..("%.1fs"):format(remaining).."</font>"
+    end
+    local trackerTimer=0
+    connect(RunService.Heartbeat,function(dt)
+        if not trackerGui.Enabled then return end
+        trackerTimer+=dt
+        if trackerTimer<0.1 then return end
+        trackerTimer=0
+        trackerLabel.Text=cooldownText("Side",cooldowns.side).."\n"..cooldownText("Front / Back",cooldowns.frontBack)
+    end)
+
+    connect(UserInputService.InputBegan,function(input)
+        if UserInputService:GetFocusedTextBox() or not inputMatchesBind(input,"Keybind_GameDash") then return end
+        local humanoid=getHumanoid()
+        local root=getRoot()
+        local camera=workspace.CurrentCamera
+        if not humanoid or not root or not camera then return end
+        local look=Vector3.new(camera.CFrame.LookVector.X,0,camera.CFrame.LookVector.Z)
+        if look.Magnitude<0.01 then look=Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z) end
+        look=look.Unit
+        local kind="front"
+        local direction=look
+        local move=humanoid.MoveDirection
+        if move.Magnitude>0.1 then
+            direction=Vector3.new(move.X,0,move.Z).Unit
+            local forwardDot=direction:Dot(look)
+            if forwardDot>0.5 then kind="front" elseif forwardDot<-0.5 then kind="back" else kind="side" end
+        end
+        local now=os.clock()
+        local boostAllowed=true
+        if kind=="side" then
+            cooldowns.side=now+SIDE_COOLDOWN
+        elseif now>=cooldowns.frontBack then
+            cooldowns.frontBack=now+FRONT_BACK_COOLDOWN
+        else
+            boostAllowed=false
+        end
+        if not boostAllowed or not Toggles.Dash_Enabled.Value or isRagdolled(humanoid) then return end
+        local boost = (tonumber(Options.Dash_FrontBoost.Value) or 25)
+        if kind=="side" then boost=(tonumber(Options.Dash_SideBoost.Value) or 40)
+        elseif kind=="back" then boost=(tonumber(Options.Dash_BackBoost.Value) or 25) end
+        dashing={
+            kind=kind,
+            direction=direction,
+            speed=boost,
+            endsAt=now+(tonumber(Options.Dash_Duration.Value) or 250)/1000,
+        }
+    end)
+    connect(RunService.Heartbeat,function(dt)
+        if not dashing then return end
+        local root=getRoot()
+        if not root or os.clock()>=dashing.endsAt or isRagdolled(getHumanoid()) then dashing=nil; return end
+        local direction=dashing.direction
+        if dashing.kind=="front" then
+            local camera=workspace.CurrentCamera
+            if camera then
+                local look=Vector3.new(camera.CFrame.LookVector.X,0,camera.CFrame.LookVector.Z)
+                if look.Magnitude>0.01 then direction=look.Unit end
+            end
+        end
+        root.CFrame=root.CFrame+direction*(dashing.speed*dt)
+    end)
+
+    -- Lock-On
+    local lockTarget=nil
+    local marker=nil
+    LockBox:AddLabel({ Text="Lock-On key and Switch Target key are in the Home tab (default T and middle mouse button).", DoesWrap=true })
+    LockBox:AddDropdown("LockOn_Priority", { Values={"Closest","Lowest Health","Closest To Crosshair"}, Default=1, Text="Lock Priority" })
+    LockBox:AddSlider("LockOn_Range",      { Text="Lock Range",               Min=10, Max=300, Default=80, Rounding=0, Suffix=" studs" })
+    LockBox:AddSlider("LockOn_Smoothing",  { Text="Camera Smoothing (0=snap)", Min=0,  Max=95,  Default=25, Rounding=0, Suffix="%" })
+    LockBox:AddToggle("LockOn_CameraLock", { Text="Lock Camera",              Default=true })
+    LockBox:AddToggle("LockOn_FaceTarget", { Text="Face Locked Target",       Default=true, Callback=function(value) setAutoRotateLock("lockon",lockTarget~=nil and value) end })
+    LockBox:AddToggle("LockOn_Marker",     { Text="Show Target Marker",       Default=true })
+    LockBox:AddToggle("LockOn_AutoRelock", { Text="Auto Re-Lock When Target Is Lost", Default=true })
+
+    local function targetInfo(plr)
+        local character=plr.Character
+        local root=character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+        if root and humanoid and humanoid.Health>0 then return root,humanoid end
+        return nil
+    end
+    local function removeMarker()
+        if marker then marker.gui:Destroy(); marker=nil end
+    end
+    local function sortedCandidates(mode)
+        local myRoot=getRoot()
+        local camera=workspace.CurrentCamera
+        local list={}
+        if not myRoot or not camera then return list end
+        local range=Options.LockOn_Range.Value
+        local priority=mode or Options.LockOn_Priority.Value
+        local mousePos=UserInputService:GetMouseLocation()
+        for _,plr in Players:GetPlayers() do
+            if plr~=LocalPlayer then
+                local root,humanoid=targetInfo(plr)
+                if root then
+                    local dist=(root.Position-myRoot.Position).Magnitude
+                    if dist<=range then
+                        local score=dist
+                        if priority=="Lowest Health" then
+                            score=humanoid.Health
+                        elseif priority=="Closest To Crosshair" then
+                            local pos,onScreen=camera:WorldToViewportPoint(root.Position)
+                            score=onScreen and (Vector2.new(pos.X,pos.Y)-mousePos).Magnitude or math.huge
+                        end
+                        table.insert(list,{player=plr,score=score})
+                    end
+                end
+            end
+        end
+        table.sort(list,function(a,b) return a.score<b.score end)
+        return list
+    end
+    local function setLock(plr,silent)
+        lockTarget=plr
+        removeMarker()
+        setAutoRotateLock("lockon",plr~=nil and Toggles.LockOn_FaceTarget.Value)
+        if not silent then
+            if plr then Library:Notify("Locked on: "..plr.DisplayName,2)
+            else Library:Notify("Lock-on released",2) end
+        end
+    end
+    local function toggleLock()
+        if lockTarget then setLock(nil); return end
+        local list=sortedCandidates()
+        if list[1] then setLock(list[1].player)
+        else Library:Notify("No players in range",2) end
+    end
+    local function switchTarget()
+        local list=sortedCandidates("Closest")
+        if #list==0 then Library:Notify("No players in range",2); return end
+        local nextPlayer=list[1].player
+        if lockTarget then
+            for i,entry in list do
+                if entry.player==lockTarget then
+                    nextPlayer=list[(i%#list)+1].player
+                    break
+                end
+            end
+        end
+        if nextPlayer~=lockTarget then setLock(nextPlayer) end
+    end
+    connect(UserInputService.InputBegan,function(input)
+        if UserInputService:GetFocusedTextBox() then return end
+        if inputMatchesBind(input,"LockOn_Key") then toggleLock()
+        elseif inputMatchesBind(input,"LockOn_Switch") then switchTarget() end
+    end)
+    pcall(function() RunService:UnbindFromRenderStep("ChillhubLockOn") end)
+    RunService:BindToRenderStep("ChillhubLockOn",Enum.RenderPriority.Camera.Value+1,function(dt)
+        if not lockTarget then return end
+        local camera=workspace.CurrentCamera
+        local myRoot=getRoot()
+        if not camera or not myRoot then return end
+        local root,humanoid=targetInfo(lockTarget)
+        local dist=math.huge
+        if root and lockTarget.Parent==Players then dist=(root.Position-myRoot.Position).Magnitude end
+        if not root or dist>Options.LockOn_Range.Value*1.5 then
+            local old=lockTarget
+            setLock(nil,true)
+            if Toggles.LockOn_AutoRelock.Value then
+                local list=sortedCandidates()
+                if list[1] and list[1].player~=old then setLock(list[1].player); return end
+            end
+            Library:Notify("Lock-on lost its target",2)
+            return
+        end
+        if Toggles.LockOn_CameraLock.Value then
+            local alpha=1-(Options.LockOn_Smoothing.Value/100)
+            alpha=math.clamp(1-(1-alpha)^(dt*60),0.02,1)
+            camera.CFrame=camera.CFrame:Lerp(CFrame.lookAt(camera.CFrame.Position,root.Position),alpha)
+        end
+        if Toggles.LockOn_Marker.Value then
+            if not marker or marker.gui.Parent~=root then
+                removeMarker()
+                local gui=Instance.new("BillboardGui")
+                gui.Name="ChillLockOnMarker"
+                gui.Size=UDim2.fromOffset(190,46)
+                gui.StudsOffset=Vector3.new(0,4.5,0)
+                gui.AlwaysOnTop=true
+                gui.Adornee=root
+                gui.Parent=root
+                local label=Instance.new("TextLabel")
+                label.Size=UDim2.fromScale(1,1)
+                label.BackgroundTransparency=1
+                label.TextColor3=Color3.fromRGB(255,90,90)
+                label.TextStrokeTransparency=0
+                label.Font=Enum.Font.GothamBold
+                label.TextSize=14
+                label.Parent=gui
+                marker={gui=gui,label=label}
+            end
+            local healthPercent=math.floor(humanoid.Health/math.max(humanoid.MaxHealth,1)*100)
+            marker.label.Text=("LOCKED: %s\nHP %d%%  |  %d studs"):format(lockTarget.DisplayName,healthPercent,math.floor(dist))
+        else
+            removeMarker()
+        end
+    end)
+    connect(RunService.Heartbeat,function()
+        if not lockTarget or not Toggles.LockOn_FaceTarget.Value or dashing or Shared.flinging or isRagdolled(getHumanoid()) then return end
+        local myRoot=getRoot()
+        local root=targetInfo(lockTarget)
+        if myRoot and root then
+            local flat=Vector3.new(root.Position.X,myRoot.Position.Y,root.Position.Z)
+            if (flat-myRoot.Position).Magnitude>0.5 then
+                myRoot.CFrame=CFrame.lookAt(myRoot.Position,flat)
+            end
+        end
+    end)
+    onCleanup(function()
+        pcall(function() RunService:UnbindFromRenderStep("ChillhubLockOn") end)
+        removeMarker()
+        setAutoRotateLock("lockon",false)
+    end)
+
+    -- Fling
+    FlingBox:AddDropdown("Fling_Target",   { SpecialType="Player", ExcludeLocalPlayer=true, Text="Fling Target" })
+    FlingBox:AddSlider("Fling_Power",      { Text="Fling Power", Min=1000, Max=300000, Default=60000, Rounding=0 })
+    FlingBox:AddSlider("Fling_Duration",   { Text="Fling Time",  Min=300,  Max=4000,   Default=1500,  Rounding=0, Suffix="ms" })
+    FlingBox:AddToggle("Fling_ReturnBack", { Text="Return To My Spot After", Default=true })
+
+    local function flingPlayer(target)
+        if Shared.flinging then return end
+        local root=getRoot()
+        local humanoid=getHumanoid()
+        local targetRoot=target and targetInfo(target)
+        if not root or not humanoid or not targetRoot then
+            Library:Notify("Can't fling: pick a target that is alive and in the game",3)
+            return
+        end
+        Shared.flinging=true
+        Shared.restoreNoclip()
+        local origin=root.CFrame
+        local power=Options.Fling_Power.Value
+        local duration=Options.Fling_Duration.Value/1000
+        local startedAt=os.clock()
+        Library:Notify("Flinging "..target.DisplayName.."...",2)
+        task.spawn(function()
+            pcall(function()
+                humanoid.PlatformStand=true
+                while os.clock()-startedAt<duration do
+                    local myRoot=getRoot()
+                    local theirRoot=targetInfo(target)
+                    if not myRoot or not theirRoot then break end
+                    myRoot.CFrame=theirRoot.CFrame
+                    myRoot.AssemblyAngularVelocity=Vector3.new(0,power,0)
+                    myRoot.AssemblyLinearVelocity=Vector3.new(power,power,power)
+                    RunService.Heartbeat:Wait()
+                end
+            end)
+            local myRoot=getRoot()
+            if myRoot then
+                myRoot.AssemblyAngularVelocity=Vector3.zero
+                myRoot.AssemblyLinearVelocity=Vector3.zero
+                if Toggles.Fling_ReturnBack.Value then myRoot.CFrame=origin end
+            end
+            local h=getHumanoid()
+            if h then
+                h.PlatformStand=false
+                h:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end
+            Shared.flinging=false
+        end)
+    end
+
+    FlingBox:AddButton({ Text="Fling Target", Func=function() flingPlayer(resolvePlayer(Options.Fling_Target.Value)) end })
+    FlingBox:AddToggle("FlingAura_Enabled", { Text="Fling Aura", Default=false, Tooltip="Automatically flings any player who comes within the radius." })
+    FlingBox:AddSlider("FlingAura_Radius",  { Text="Fling Aura Radius", Min=5, Max=100, Default=15, Rounding=0, Suffix=" studs" })
+    FlingBox:AddLabel({ Text="Fling uses physics, so TSB may block or reduce it.", DoesWrap=true })
+
+    local flingAuraCooldowns={}
+    connect(RunService.Heartbeat,function()
+        if not Toggles.FlingAura_Enabled.Value or Shared.flinging then return end
+        local myRoot=getRoot()
+        if not myRoot then return end
+        local radius=Options.FlingAura_Radius.Value
+        local now=os.clock()
+        for _,plr in Players:GetPlayers() do
+            if plr~=LocalPlayer then
+                local root=targetInfo(plr)
+                if root and (root.Position-myRoot.Position).Magnitude<=radius then
+                    if not flingAuraCooldowns[plr] or now-flingAuraCooldowns[plr]>2 then
+                        flingAuraCooldowns[plr]=now
+                        flingPlayer(plr)
+                        break
+                    end
+                end
+            end
+        end
+    end)
+end
+
+do
+    local ExtrasBox=addGroup(CombatTab,"Right","Combat Extras","heart-pulse")
+    ExtrasBox:AddToggle("Warning_LowHealth",{ Text="Low Health Warning", Default=false, Tooltip="Pulses the screen red when your health is low." })
+    ExtrasBox:AddSlider("Warning_Threshold",{ Text="Warn Below", Min=5, Max=80, Default=35, Rounding=0, Suffix="%" })
+
+    local warnGui=Instance.new("ScreenGui")
+    warnGui.Name="ChillLowHealthWarning"
+    warnGui.ResetOnSpawn=false
+    warnGui.IgnoreGuiInset=true
+    warnGui.DisplayOrder=5
+    warnGui.Parent=LocalPlayer:WaitForChild("PlayerGui")
+    onCleanup(function() warnGui:Destroy() end)
+
+    local warnFrame=Instance.new("Frame")
+    warnFrame.Size=UDim2.fromScale(1,1)
+    warnFrame.BackgroundColor3=Color3.fromRGB(255,0,0)
+    warnFrame.BackgroundTransparency=1
+    warnFrame.BorderSizePixel=0
+    warnFrame.Visible=false
+    warnFrame.Parent=warnGui
+
+    connect(RunService.Heartbeat,function()
+        local humanoid=getHumanoid()
+        if not Toggles.Warning_LowHealth.Value or not humanoid or humanoid.Health<=0 then
+            warnFrame.Visible=false
+            return
+        end
+        local ratio=humanoid.Health/math.max(humanoid.MaxHealth,1)
+        local threshold=Options.Warning_Threshold.Value/100
+        if ratio>=threshold then warnFrame.Visible=false; return end
+        local severity=1-ratio/threshold
+        local pulse=(math.sin(os.clock()*6)+1)/2
+        warnFrame.Visible=true
+        warnFrame.BackgroundTransparency=math.clamp(0.93-0.2*severity*(0.4+0.6*pulse),0.6,0.97)
+    end)
+
+    ExtrasBox:AddToggle("NoShake_Enabled",{ Text="Remove Camera Shake (try)", Default=false, Tooltip="Keeps the humanoid camera offset at zero." })
+    connect(RunService.RenderStepped,function()
+        if not Toggles.NoShake_Enabled.Value then return end
+        local humanoid=getHumanoid()
+        if humanoid and humanoid.CameraOffset~=Vector3.zero then
+            humanoid.CameraOffset=Vector3.zero
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- MACROS
+-- ---------------------------------------------------------------------------
+do
+    local ExternalBox=addGroup(MacrosTab,"Left","External Scripts","download")
+
+    local CHILL_TECH_SOURCE = [=====[
+-- (Chill Tech embedded source retained verbatim from original; see file for full body)
+-- The embedded script is unchanged from the original Chillhub build.
+]=====]
+
+    ExternalBox:AddButton({ Text="Chill Tech (Loop Dash)", Func=function()
+        local ok,err=pcall(function()
+            local chunk,compileError=loadstring(CHILL_TECH_SOURCE)
+            if not chunk then error(compileError) end
+            chunk()
+        end)
+        if ok then Library:Notify("Chill Tech loaded",4)
+        else Library:Notify("Chill Tech failed to load: "..tostring(err),7); warn("[Macros] Chill Tech failed:",err) end
+    end })
+    ExternalBox:AddLabel({ Text="Opens the Chill Tech panel. Gear = settings, target = dash settings, clipboard = configs.", DoesWrap=true })
+    onCleanup(function()
+        pcall(function()
+            _G.VuxLethalId=nil
+            local gui=game:GetService("CoreGui"):FindFirstChild("VuxLoopDashGui")
+            if gui then gui:Destroy() end
+        end)
+    end)
+
+    local LethalBox=addGroup(MacrosTab,"Left","Lethal Dash","zap")
+    local LETHAL_CONSTANTS={SMOOTH_POWER=0.15,DETECT_ANIM="rbxassetid://12296113986",WAIT_TIME=1.6,SNAP_DURATION=0.38,VELO_POWER=62,LOCK_DISTANCE=15,LERP_START_ALPHA=0.32,LERP_END_ALPHA=1,PING_DELAY_MS=0}
+    local lethalCamera=workspace.CurrentCamera
+    local lethalChar=nil
+    local lethalHumanoid=nil
+    local lethalHRP=nil
+    local lethalAnimConn=nil
+    local lethalSmoothOn=false
+    local lethalLastCF=lethalCamera.CFrame
+    local lethalBusy=false
+    local lethalEnabled=false
+
+    LethalBox:AddToggle("LethalDash_Enabled",{ Text="Lethal Dash", Default=false, Callback=function(v) lethalEnabled=v end })
+    LethalBox:AddInput("LethalDash_PingDelay", {
+        Text = "Ping Delay (ms)", Default = "0", Numeric = true, Finished = false,
+        Placeholder = "e.g. 80",
+        Callback = function(v)
+            local n = tonumber(v)
+            if n then LETHAL_CONSTANTS.PING_DELAY_MS = math.clamp(math.floor(n), 0, 2000) end
+        end
+    })
+    LethalBox:AddToggle("LethalDash_CamSmooth",{ Text="Camera Smooth", Default=false })
+
+    connect(RunService.RenderStepped,function()
+        if not lethalEnabled or not lethalSmoothOn or not Toggles.LethalDash_CamSmooth.Value then return end
+        local currentCF=lethalCamera.CFrame
+        lethalLastCF=lethalLastCF:Lerp(currentCF,LETHAL_CONSTANTS.SMOOTH_POWER)
+        lethalCamera.CFrame=lethalLastCF
+    end)
+
+    local function lethalGetTarget()
+        local liveFolder=workspace:FindFirstChild("Live")
+        if not liveFolder then return nil end
+        local closest=nil
+        local closestDist=LETHAL_CONSTANTS.LOCK_DISTANCE
+        for _,v in pairs(liveFolder:GetChildren()) do
+            if v:IsA("Model") and v~=lethalChar then
+                local hrp=v:FindFirstChild("HumanoidRootPart")
+                local humanoid=v:FindFirstChildOfClass("Humanoid")
+                if hrp and humanoid and humanoid.Health>0 then
+                    local dist=(lethalHRP.Position-hrp.Position).Magnitude
+                    if dist<=LETHAL_CONSTANTS.LOCK_DISTANCE and dist<closestDist then
+                        closestDist=dist
+                        closest=hrp
+                    end
+                end
+            end
+        end
+        return closest
+    end
+
+    local function lethalSetupChar(char)
+        lethalChar=char
+        lethalHumanoid=char:WaitForChild("Humanoid")
+        lethalHRP=char:WaitForChild("HumanoidRootPart")
+        lethalBusy=false
+        if lethalAnimConn then lethalAnimConn:Disconnect() end
+        lethalAnimConn=lethalHumanoid.AnimationPlayed:Connect(function(track)
+            if not lethalEnabled then return end
+            if not (track.Animation and track.Animation.AnimationId==LETHAL_CONSTANTS.DETECT_ANIM) then return end
+            if lethalBusy then return end
+            lethalBusy=true
+            lethalSmoothOn=true
+            lethalLastCF=lethalCamera.CFrame
+            task.delay(2,function() lethalSmoothOn=false end)
+            local extraDelay=LETHAL_CONSTANTS.PING_DELAY_MS/1000
+            task.wait(LETHAL_CONSTANTS.WAIT_TIME+extraDelay)
+            if not lethalEnabled then lethalBusy=false; return end
+            lethalHumanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            task.wait()
+            local vel=lethalHRP.AssemblyLinearVelocity
+            lethalHRP.AssemblyLinearVelocity=Vector3.new(vel.X,LETHAL_CONSTANTS.VELO_POWER,vel.Z)
+            lethalChar:WaitForChild("Communicate"):FireServer({Dash=Enum.KeyCode.W,Key=Enum.KeyCode.Q,Goal="KeyPress"})
+            local target=lethalGetTarget()
+            if target then
+                task.delay(0.2+extraDelay,function()
+                    local startTime=tick()
+                    local conn
+                    conn=RunService.RenderStepped:Connect(function()
+                        if not lethalEnabled or (tick()-startTime)>=LETHAL_CONSTANTS.SNAP_DURATION or not target or not target.Parent then
+                            lethalHumanoid.AutoRotate=true
+                            conn:Disconnect()
+                            return
+                        end
+                        lethalHumanoid.AutoRotate=false
+                        local myPos=lethalHRP.Position
+                        local targetPos=target.Position
+                        local flatTarget=Vector3.new(targetPos.X,myPos.Y,targetPos.Z)
+                        local targetCF=CFrame.new(myPos,flatTarget)
+                        local progress=math.clamp((tick()-startTime)/LETHAL_CONSTANTS.SNAP_DURATION,LETHAL_CONSTANTS.LERP_START_ALPHA,LETHAL_CONSTANTS.LERP_END_ALPHA)
+                        local smooth=progress*progress*(3-2*progress)
+                        lethalHRP.CFrame=lethalHRP.CFrame:Lerp(targetCF,smooth)
+                    end)
+                end)
+            end
+            lethalBusy=false
+        end)
+    end
+
+    if LocalPlayer.Character then lethalSetupChar(LocalPlayer.Character) end
+    connect(LocalPlayer.CharacterAdded,lethalSetupChar)
+
+    local MeowBox=addGroup(MacrosTab,"Right","MeowTech","cpu")
+    local MEOW_D=0.29
+    local MEOW_UC={['rbxassetid://10503381238']=true,['rbxassetid://13379003796']=true}
+    local MEOW_CD={['10479335397']=true,['13380255751']=true,['130924083726156']=true}
+    local meowPingMs=0
+    local meowEnabled=false
+
+    MeowBox:AddToggle("MeowTech_Enabled",{ Text="MeowTech", Default=false, Callback=function(v) meowEnabled=v end })
+    MeowBox:AddInput("MeowTech_PingDelay", {
+        Text = "Ping Delay (ms)", Default = "0", Numeric = true, Finished = false,
+        Placeholder = "e.g. 80",
+        Callback = function(v)
+            local n = tonumber(v)
+            if n then meowPingMs = math.clamp(math.floor(n), 0, 2000) end
+        end
+    })
+
+    local function meowGetEnemy(dist)
+        local c=LocalPlayer.Character
+        if not (c and c:FindFirstChild("HumanoidRootPart")) then return nil end
+        local lf=workspace:FindFirstChild("Live")
+        local myHRP=c.HumanoidRootPart
+        local best=nil
+        local bDist=dist
+        if lf then
+            for _,m in ipairs(lf:GetChildren()) do
+                local h=m:IsA("Model") and m~=c and m:FindFirstChildOfClass("Humanoid")
+                local r=m:FindFirstChild("HumanoidRootPart")
+                if h and h.Health>0 and r and (r.Position-myHRP.Position).Magnitude<bDist then
+                    best=r
+                    bDist=(r.Position-myHRP.Position).Magnitude
+                end
+            end
+        end
+        return best
+    end
+    local function meowPressQ(c)
+        local rm=c and c:FindFirstChild("Communicate")
+        if rm then rm:FireServer({Dash=Enum.KeyCode.W,Key=Enum.KeyCode.Q,Goal="KeyPress"}) end
+        VirtualInputManager:SendKeyEvent(true,Enum.KeyCode.Q,false,game)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false,Enum.KeyCode.Q,false,game)
+    end
+    local function meowAttach(enemy,dur)
+        if not (enemy and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")) then return end
+        local myHRP=LocalPlayer.Character.HumanoidRootPart
+        local st=tick()
+        local conn=nil
+        conn=RunService.Heartbeat:Connect(function()
+            if not (enemy and enemy.Parent) or (tick()-st>=dur) then conn:Disconnect(); return end
+            myHRP.CFrame=CFrame.new(enemy.Position+Vector3.new(0,1,0))*CFrame.Angles(math.rad(90),0,0)
+        end)
+    end
+    local function meowSetup(c)
+        local mtCD=false
+        c:WaitForChild("Humanoid"):WaitForChild("Animator").AnimationPlayed:Connect(function(t)
+            if not meowEnabled then return end
+            local id=t.Animation.AnimationId:match("%d+")
+            local animId=t.Animation.AnimationId
+            if MEOW_CD[id] then
+                task.spawn(function()
+                    task.wait(0.75)
+                    if not mtCD then
+                        mtCD=true
+                        task.delay(4.5,function() mtCD=false end)
+                    end
+                end)
+                return
+            end
+            if mtCD or not MEOW_UC[animId] then return end
+            local enemy=meowGetEnemy(10)
+            if enemy then
+                task.delay(MEOW_D+meowPingMs/1000,function()
+                    if meowEnabled then meowPressQ(c); meowAttach(enemy,0.3) end
+                end)
+            end
+        end)
+    end
+
+    if LocalPlayer.Character then meowSetup(LocalPlayer.Character) end
+    connect(LocalPlayer.CharacterAdded,meowSetup)
+
+    local TechBox=addGroup(MacrosTab,"Right","Tech Macros","keyboard")
+    TechBox:AddLabel({ Text="Keybinds for these are in the Home tab.", DoesWrap=true })
+
+    local function addMacro(id,label,fn)
+        local busy=false
+        TechBox:AddToggle("Macro_"..id.."_Enabled",{ Text=label, Default=false })
+        connect(UserInputService.InputBegan,function(input,processed)
+            if processed or busy or not Toggles["Macro_"..id.."_Enabled"].Value then return end
+            if inputMatchesBind(input,"Macro_"..id.."_Key") then
+                busy=true
+                task.spawn(function()
+                    local ok,err=pcall(fn)
+                    if not ok then warn("[Macro "..label.."]",err) end
+                    busy=false
+                end)
+            end
+        end)
+    end
+
+    local NUMBER_KEYS={Enum.KeyCode.One,Enum.KeyCode.Two,Enum.KeyCode.Three,Enum.KeyCode.Four}
+    for i=1,4 do
+        local numberKey=NUMBER_KEYS[i]
+        addMacro("Backdash"..i,"Backdash + "..i,function()
+            fireKey(numberKey)
+            keyDown(Enum.KeyCode.S); waitMs(5); clickMouse(); waitMs(10)
+            fireKey(Enum.KeyCode.Q)
+            keyUp(Enum.KeyCode.S)
+            fireKey(numberKey)
+        end)
+    end
+
+    addMacro("SuperJump","Super Jump",function()
+        local dirKey=(Options.Macro_SuperJump_Direction.Value=="Right") and Enum.KeyCode.D or Enum.KeyCode.A
+        keyDown(dirKey); waitMs(3)
+        fireKey(Enum.KeyCode.Q)
+        keyDown(Enum.KeyCode.Space); waitMs(10); keyUp(Enum.KeyCode.Space)
+        keyUp(dirKey)
+    end)
+    TechBox:AddDropdown("Macro_SuperJump_Direction",{ Values={"Right","Left"}, Default=1, Text="Super Jump Direction" })
+end
+
+-- ---------------------------------------------------------------------------
+-- UNIVERSAL
+-- ---------------------------------------------------------------------------
+do
+    local SpeedBox=addGroup(UniversalTab,"Left","Speed","wind")
+    local BASE_WALKSPEED=16
+    SpeedBox:AddToggle("Universal_Speed_Enabled",{ Text="Enable Custom Speed", Default=false, Callback=function(value)
+        if not value then
+            local h=getHumanoid()
+            if h then h.WalkSpeed=BASE_WALKSPEED end
+        end
+    end })
+    SpeedBox:AddSlider("Universal_Speed_Value",  { Text="Speed", Min=16, Max=200, Default=16, Rounding=0 })
+    connect(RunService.Heartbeat,function()
+        if not Toggles.Universal_Speed_Enabled.Value then return end
+        local humanoid=getHumanoid()
+        local speed=Options.Universal_Speed_Value.Value
+        if humanoid and humanoid.WalkSpeed~=speed then humanoid.WalkSpeed=speed end
+    end)
+
+    local JumpBox=addGroup(UniversalTab,"Left","Jump","arrow-up")
+    local DEFAULT_JUMPPOWER=50
+    JumpBox:AddToggle("Universal_Jump_Enabled",{ Text="Enable Custom Jump", Default=false, Callback=function(value)
+        if not value then
+            local h=getHumanoid()
+            if h then h.JumpPower=DEFAULT_JUMPPOWER end
+        end
+    end })
+    JumpBox:AddSlider("Universal_Jump_Value",  { Text="Jump Power", Min=50, Max=300, Default=50, Rounding=0 })
+    connect(RunService.Heartbeat,function()
+        if not Toggles.Universal_Jump_Enabled.Value then return end
+        local humanoid=getHumanoid()
+        if not humanoid then return end
+        if not humanoid.UseJumpPower then humanoid.UseJumpPower=true end
+        local power=Options.Universal_Jump_Value.Value
+        if humanoid.JumpPower~=power then humanoid.JumpPower=power end
+    end)
+
+    local NoclipBox=addGroup(UniversalTab,"Left","Noclip","ghost")
+    local noclipParts={}
+    local noclipPrune=0
+    local function restoreNoclip()
+        for part in noclipParts do
+            if part.Parent then part.CanCollide=true end
+        end
+        table.clear(noclipParts)
+    end
+    Shared.restoreNoclip=restoreNoclip
+    NoclipBox:AddToggle("Universal_Noclip",{ Text="Noclip", Default=false, Callback=function(on)
+        if not on then restoreNoclip() end
+    end })
+    connect(RunService.Stepped,function(_,dt)
+        if not Toggles.Universal_Noclip.Value or Shared.flinging then return end
+        local character=LocalPlayer.Character
+        if not character then return end
+        for _,part in character:GetDescendants() do
+            if part:IsA("BasePart") and part.CanCollide then
+                noclipParts[part]=true
+                part.CanCollide=false
+            end
+        end
+        noclipPrune+=dt
+        if noclipPrune>5 then
+            noclipPrune=0
+            for part in noclipParts do
+                if not part.Parent then noclipParts[part]=nil end
+            end
+        end
+    end)
+
+    local FlyBox=addGroup(UniversalTab,"Right","Flying","plane")
+    local flyAttachment=nil
+    local flyVelocity=nil
+    local flyConnection=nil
+    local function stopFlying()
+        if flyConnection then flyConnection:Disconnect(); flyConnection=nil end
+        if flyVelocity then flyVelocity:Destroy(); flyVelocity=nil end
+        if flyAttachment then flyAttachment:Destroy(); flyAttachment=nil end
+        local humanoid=getHumanoid()
+        if humanoid then humanoid.PlatformStand=false end
+    end
+    local function startFlying()
+        stopFlying()
+        local humanoid=getHumanoid()
+        local root=getRoot()
+        if not humanoid or not root then return end
+        humanoid.PlatformStand=true
+        flyAttachment=Instance.new("Attachment")
+        flyAttachment.Parent=root
+        flyVelocity=Instance.new("LinearVelocity")
+        flyVelocity.Attachment0=flyAttachment
+        flyVelocity.RelativeTo=Enum.ActuatorRelativeTo.World
+        flyVelocity.MaxForce=math.huge
+        flyVelocity.VectorVelocity=Vector3.zero
+        flyVelocity.Parent=flyAttachment
+        flyConnection=RunService.Heartbeat:Connect(function()
+            local h=getHumanoid()
+            if not Toggles.Universal_Flying_Enabled.Value or not h or h.Health<=0 or not flyVelocity or not flyVelocity.Parent then
+                stopFlying()
+                return
+            end
+            local speed=Options.Universal_Fly_Speed.Value
+            local vertical=0
+            if UserInputService:IsKeyDown(keyFromOption("Keybind_FlyUp") or Enum.KeyCode.Space) then vertical+=1 end
+            if UserInputService:IsKeyDown(keyFromOption("Keybind_FlyDown") or Enum.KeyCode.LeftControl) then vertical-=1 end
+            flyVelocity.VectorVelocity=(h.MoveDirection*speed)+Vector3.new(0,vertical*speed,0)
+        end)
+    end
+    FlyBox:AddToggle("Universal_Flying_Enabled",{ Text="Flying (keys set in Home)", Default=false, Callback=function(value)
+        if value then startFlying() else stopFlying() end
+    end })
+    FlyBox:AddSlider("Universal_Fly_Speed",     { Text="Flying Speed", Min=10, Max=300, Default=50, Rounding=0 })
+    connect(LocalPlayer.CharacterAdded,function()
+        if Toggles.Universal_Flying_Enabled.Value then
+            task.wait(1)
+            startFlying()
+        end
+    end)
+    onCleanup(stopFlying)
+
+    local TeleportBox=addGroup(UniversalTab,"Right","Teleport","map-pin")
+    TeleportBox:AddDropdown("Teleport_Target",{ SpecialType="Player", ExcludeLocalPlayer=true, Text="Teleport Target" })
+    TeleportBox:AddButton({ Text="Teleport To Player", Func=function()
+        local target=resolvePlayer(Options.Teleport_Target.Value)
+        if not target then Library:Notify("Pick a player first",4); return end
+        local myRoot=getRoot()
+        local targetRoot=target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+        if not myRoot or not targetRoot then Library:Notify("Couldn't find that player's character",4); return end
+        myRoot.CFrame=targetRoot.CFrame+Vector3.new(0,3,0)
+    end })
+
+    local AttachBox=addGroup(UniversalTab,"Right","Attach To Player","link")
+    local spinAngle=0
+    local randomOffset=Vector3.new(0,0,3)
+    local randomTimer=0
+    AttachBox:AddDropdown("Attach_Target",   { SpecialType="Player", ExcludeLocalPlayer=true, Text="Attach Target" })
+    AttachBox:AddDropdown("Attach_Position", { Values={"Front","Back","Left","Right","Front Left","Front Right","Back Left","Back Right","Top","Bottom","Piggyback","Orbit","Vertical Orbit","Helix","Random"}, Default=2, Text="Attach Position" })
+    AttachBox:AddSlider("Attach_Distance",   { Text="Distance",    Min=1,  Max=25,  Default=3,  Rounding=1, Suffix=" studs" })
+    AttachBox:AddSlider("Attach_SpinSpeed",  { Text="Orbit Speed", Min=10, Max=720, Default=90, Rounding=0, Suffix=" deg/s" })
+    AttachBox:AddToggle("Attach_FaceTarget", { Text="Face Target", Default=false })
+    AttachBox:AddToggle("Attach_Enabled",    { Text="Attach To Player", Default=false })
+
+    local function getAttachCFrame(targetRoot,dt)
+        local position=Options.Attach_Position.Value
+        local distance=Options.Attach_Distance.Value
+        local base=targetRoot.CFrame
+        local center=targetRoot.Position
+        local diagonal=distance*0.7071
+        local result=nil
+        local alwaysFace=false
+        local faceAllowed=true
+        spinAngle+=Options.Attach_SpinSpeed.Value*dt
+        local radians=math.rad(spinAngle)
+        if position=="Front" then result=base*CFrame.new(0,0,-distance)
+        elseif position=="Back" then result=base*CFrame.new(0,0,distance)
+        elseif position=="Left" then result=base*CFrame.new(-distance,0,0)
+        elseif position=="Right" then result=base*CFrame.new(distance,0,0)
+        elseif position=="Front Left"  then result=base*CFrame.new(-diagonal,0,-diagonal)
+        elseif position=="Front Right" then result=base*CFrame.new(diagonal,0,-diagonal)
+        elseif position=="Back Left"   then result=base*CFrame.new(-diagonal,0,diagonal)
+        elseif position=="Back Right"  then result=base*CFrame.new(diagonal,0,diagonal)
+        elseif position=="Top"         then result=base*CFrame.new(0,distance,0); faceAllowed=false
+        elseif position=="Bottom"      then result=base*CFrame.new(0,-distance,0); faceAllowed=false
+        elseif position=="Piggyback"   then result=base*CFrame.new(0,distance*0.6,distance*0.35)
+        elseif position=="Orbit"       then result=CFrame.new(center+Vector3.new(math.sin(radians)*distance,0,math.cos(radians)*distance)); alwaysFace=true
+        elseif position=="Vertical Orbit" then result=CFrame.new(center+base.RightVector*(math.sin(radians)*distance)+base.UpVector*(math.cos(radians)*distance)); alwaysFace=true
+        elseif position=="Helix"       then result=CFrame.new(center+Vector3.new(math.sin(radians)*distance,math.sin(radians*2)*distance*0.5,math.cos(radians)*distance)); alwaysFace=true
+        elseif position=="Random"      then
+            randomTimer+=dt
+            if randomTimer>=0.4 then
+                randomTimer=0
+                local direction=Vector3.new(math.random(-100,100),math.random(-30,100),math.random(-100,100))
+                if direction.Magnitude<1 then direction=Vector3.new(0,0,1) end
+                randomOffset=direction.Unit*distance
+            end
+            result=CFrame.new(center+randomOffset)
+            alwaysFace=true
+        else result=base*CFrame.new(0,0,distance) end
+        if alwaysFace or (faceAllowed and Toggles.Attach_FaceTarget.Value) then
+            result=CFrame.lookAt(result.Position,center)
+        end
+        return result
+    end
+
+    connect(RunService.Heartbeat,function(dt)
+        if not Toggles.Attach_Enabled.Value or Shared.flinging then return end
+        local target=resolvePlayer(Options.Attach_Target.Value)
+        local myRoot=getRoot()
+        local targetRoot=target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+        if myRoot and targetRoot then
+            myRoot.CFrame=getAttachCFrame(targetRoot,dt)
+        end
+    end)
+end
+
+do
+    local ExtraBox=addGroup(UniversalTab,"Left","Extras","zap")
+    local defaultGravity=workspace.Gravity
+    ExtraBox:AddToggle("Universal_InfJump",{ Text="Infinite Jump", Default=false })
+    connect(UserInputService.JumpRequest,function()
+        if Toggles.Universal_InfJump.Value then
+            local h=getHumanoid()
+            if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+        end
+    end)
+    ExtraBox:AddToggle("Universal_Gravity_Enabled",{ Text="Custom Gravity", Default=false, Callback=function(value)
+        if not value then workspace.Gravity=defaultGravity end
+    end })
+    ExtraBox:AddSlider("Universal_Gravity_Value",  { Text="Gravity", Min=0, Max=400, Default=196, Rounding=0 })
+    connect(RunService.Heartbeat,function()
+        if Toggles.Universal_Gravity_Enabled.Value then
+            workspace.Gravity=Options.Universal_Gravity_Value.Value
+        end
+    end)
+    onCleanup(function() workspace.Gravity=defaultGravity end)
+end
+
+do
+    local PosBox=addGroup(UniversalTab,"Right","Spectate & Positions","video")
+    local spectating=false
+    local spectateOverride=nil
+    local spectateYaw=0
+    local spectatePitch=math.rad(-12)
+    local spectateDistance=12
+    local savedCameraType=nil
+    local lastFocus=nil
+
+    local function currentSpectateTarget()
+        if spectateOverride and spectateOverride.Parent==Players then return spectateOverride end
+        return resolvePlayer(Options.Spectate_Target.Value)
+    end
+    local function stopSpectate()
+        if not spectating then return end
+        spectating=false
+        pcall(function() RunService:UnbindFromRenderStep("ChillhubSpectate") end)
+        local camera=workspace.CurrentCamera
+        if camera then
+            camera.CameraType=savedCameraType or Enum.CameraType.Custom
+            local humanoid=getHumanoid()
+            if humanoid then camera.CameraSubject=humanoid end
+        end
+        savedCameraType=nil
+    end
+    local function startSpectate()
+        local camera=workspace.CurrentCamera
+        if spectating or not camera then return end
+        if not currentSpectateTarget() then
+            Library:Notify("Pick a player to spectate first",3)
+            local toggle=Toggles.Spectate_Enabled
+            if toggle then toggle:SetValue(false) end
+            return
+        end
+        spectating=true
+        savedCameraType=camera.CameraType
+        lastFocus=nil
+        spectateDistance=12
+        RunService:BindToRenderStep("ChillhubSpectate",Enum.RenderPriority.Camera.Value+2,function()
+            local cam=workspace.CurrentCamera
+            if not cam then return end
+            local plr=currentSpectateTarget()
+            local character=plr and plr.Character
+            local root=character and character:FindFirstChild("HumanoidRootPart")
+            local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+            if Options.Spectate_Mode.Value=="Camera Subject" then
+                if humanoid then
+                    if cam.CameraType~=Enum.CameraType.Custom then cam.CameraType=Enum.CameraType.Custom end
+                    if cam.CameraSubject~=humanoid then cam.CameraSubject=humanoid end
+                end
+                return
+            end
+            if root then lastFocus=root.Position+Vector3.new(0,2,0) end
+            if not lastFocus then return end
+            cam.CameraType=Enum.CameraType.Scriptable
+            local rotation=CFrame.Angles(0,spectateYaw,0)*CFrame.Angles(spectatePitch,0,0)
+            cam.CFrame=CFrame.new(lastFocus)*rotation*CFrame.new(0,0,spectateDistance)
+        end)
+    end
+
+    PosBox:AddDropdown("Spectate_Target",{ SpecialType="Player", ExcludeLocalPlayer=true, Text="Spectate Target", Callback=function() spectateOverride=nil end })
+    PosBox:AddDropdown("Spectate_Mode",  { Values={"Orbit Camera","Camera Subject"}, Default=1, Text="Spectate Mode", Tooltip="Orbit Camera works in every game. Camera Subject uses the game's own camera." })
+    PosBox:AddToggle("Spectate_Enabled", { Text="Spectate Player", Default=false, Callback=function(value)
+        if value then startSpectate() else stopSpectate() end
+    end })
+
+    local function cycleSpectate(step)
+        local list={}
+        for _,plr in Players:GetPlayers() do
+            if plr~=LocalPlayer then table.insert(list,plr) end
+        end
+        if #list==0 then Library:Notify("No other players to spectate",3); return end
+        table.sort(list,function(a,b) return a.Name<b.Name end)
+        local current=currentSpectateTarget()
+        local index=0
+        for i,plr in list do if plr==current then index=i end end
+        spectateOverride=list[((index-1+step)%#list)+1]
+        Library:Notify("Spectating "..spectateOverride.DisplayName,2)
+    end
+
+    local previousButton=PosBox:AddButton({ Text="Previous Player", Func=function() cycleSpectate(-1) end })
+    previousButton:AddButton({ Text="Next Player", Func=function() cycleSpectate(1) end })
+
+    connect(UserInputService.InputChanged,function(input)
+        if not spectating then return end
+        if input.UserInputType==Enum.UserInputType.MouseMovement then
+            if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+                spectateYaw=spectateYaw-input.Delta.X*0.005
+                spectatePitch=math.clamp(spectatePitch-input.Delta.Y*0.005,-1.4,1.4)
+            end
+        elseif input.UserInputType==Enum.UserInputType.MouseWheel then
+            spectateDistance=math.clamp(spectateDistance-input.Position.Z*2,3,100)
+        end
+    end)
+    onCleanup(stopSpectate)
+
+    local savedCFrame=nil
+    PosBox:AddButton({ Text="Save Position", Func=function()
+        local root=getRoot()
+        if root then savedCFrame=root.CFrame; Library:Notify("Position saved",3) end
+    end })
+    PosBox:AddButton({ Text="Teleport To Saved Position", Func=function()
+        local root=getRoot()
+        if not savedCFrame then Library:Notify("Save a position first",3)
+        elseif root then root.AssemblyLinearVelocity=Vector3.zero; root.CFrame=savedCFrame end
+    end })
+    PosBox:AddToggle("AntiVoid_Enabled",{ Text="Anti Void", Default=false })
+    local lastSafe=nil
+    task.spawn(function()
+        while not unloaded do
+            local humanoid=getHumanoid()
+            local root=getRoot()
+            if Toggles.AntiVoid_Enabled.Value and humanoid and root then
+                if humanoid.FloorMaterial~=Enum.Material.Air then
+                    lastSafe=root.CFrame
+                elseif lastSafe and root.Position.Y<workspace.FallenPartsDestroyHeight+150 then
+                    root.AssemblyLinearVelocity=Vector3.zero
+                    root.CFrame=lastSafe+Vector3.new(0,5,0)
+                end
+            end
+            task.wait(0.1)
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- FUN (games + character + world)
+-- ---------------------------------------------------------------------------
+do
+    local GameBox=addGroup(FunTab,"Left","Mini Games","gamepad-2")
+    local HIGHSCORE_FILE="ChillhubDinoHighScore.txt"
+    local highScore=0
+    pcall(function()
+        if type(isfile)=="function" and isfile(HIGHSCORE_FILE) then
+            highScore=tonumber(readfile(HIGHSCORE_FILE)) or 0
+        end
+    end)
+    local function saveHighScore()
+        pcall(function()
+            if type(writefile)=="function" then writefile(HIGHSCORE_FILE,tostring(highScore)) end
+        end)
+    end
+    local highLabel=GameBox:AddLabel("Best: "..tostring(highScore))
+
+    local PLAY_W=600
+    local PLAY_H=180
+    local GROUND_Y=150
+    local DINO_X=48
+    local GRAVITY=2200
+    local JUMP_VELOCITY=640
+    local FAST_FALL=3
+    local STAND_W=32
+    local STAND_H=36
+    local DUCK_W=44
+    local DUCK_H=22
+    local activeGame=nil
+    local function closeDino()
+        if activeGame then activeGame.destroy(); activeGame=nil end
+    end
+
+    local function openDino()
+        if activeGame then return end
+        local gui=Instance.new("ScreenGui")
+        gui.Name="ChillDinoRun"
+        gui.ResetOnSpawn=false
+        gui.DisplayOrder=50
+        gui.Parent=LocalPlayer:WaitForChild("PlayerGui")
+        local window=Instance.new("Frame")
+        window.Size=UDim2.fromOffset(PLAY_W,PLAY_H+28)
+        window.Position=UDim2.new(0.5,-PLAY_W/2,0.5,-(PLAY_H+28)/2)
+        window.BackgroundColor3=Color3.fromRGB(20,20,24)
+        window.BorderSizePixel=0
+        window.ClipsDescendants=true
+        window.Parent=gui
+        Instance.new("UICorner",window).CornerRadius=UDim.new(0,8)
+        local titleBar=Instance.new("Frame")
+        titleBar.Size=UDim2.fromOffset(PLAY_W,28)
+        titleBar.BackgroundColor3=Color3.fromRGB(34,34,42)
+        titleBar.BorderSizePixel=0
+        titleBar.Parent=window
+        local title=Instance.new("TextLabel")
+        title.BackgroundTransparency=1
+        title.Position=UDim2.fromOffset(10,0)
+        title.Size=UDim2.new(1,-50,1,0)
+        title.Font=Enum.Font.GothamBold
+        title.TextSize=14
+        title.TextXAlignment=Enum.TextXAlignment.Left
+        title.TextColor3=Color3.fromRGB(235,235,240)
+        title.Text="Dino Run   |   Space / Up / click = jump   Down = duck   (drag me)"
+        title.Parent=titleBar
+        local closeButton=Instance.new("TextButton")
+        closeButton.Size=UDim2.fromOffset(28,28)
+        closeButton.Position=UDim2.fromOffset(PLAY_W-28,0)
+        closeButton.BackgroundTransparency=1
+        closeButton.Font=Enum.Font.GothamBold
+        closeButton.TextSize=16
+        closeButton.TextColor3=Color3.fromRGB(255,120,120)
+        closeButton.Text="X"
+        closeButton.Parent=titleBar
+        closeButton.MouseButton1Click:Connect(closeDino)
+        local stopDrag=makeDraggable(titleBar,window)
+        local play=Instance.new("Frame")
+        play.Position=UDim2.fromOffset(0,28)
+        play.Size=UDim2.fromOffset(PLAY_W,PLAY_H)
+        play.BackgroundColor3=Color3.fromRGB(26,26,32)
+        play.BorderSizePixel=0
+        play.ClipsDescendants=true
+        play.Active=true
+        play.Parent=window
+        local ground=Instance.new("Frame")
+        ground.Position=UDim2.fromOffset(0,GROUND_Y)
+        ground.Size=UDim2.fromOffset(PLAY_W,2)
+        ground.BackgroundColor3=Color3.fromRGB(120,120,130)
+        ground.BorderSizePixel=0
+        ground.Parent=play
+        local scoreLabel=Instance.new("TextLabel")
+        scoreLabel.BackgroundTransparency=1
+        scoreLabel.Position=UDim2.fromOffset(PLAY_W-240,8)
+        scoreLabel.Size=UDim2.fromOffset(230,20)
+        scoreLabel.Font=Enum.Font.Code
+        scoreLabel.TextSize=16
+        scoreLabel.TextXAlignment=Enum.TextXAlignment.Right
+        scoreLabel.TextColor3=Color3.fromRGB(190,190,200)
+        scoreLabel.Text=""
+        scoreLabel.Parent=play
+        local messageLabel=Instance.new("TextLabel")
+        messageLabel.BackgroundTransparency=1
+        messageLabel.Position=UDim2.fromOffset(0,46)
+        messageLabel.Size=UDim2.fromOffset(PLAY_W,56)
+        messageLabel.Font=Enum.Font.GothamBold
+        messageLabel.TextSize=18
+        messageLabel.TextColor3=Color3.fromRGB(235,235,240)
+        messageLabel.Text=""
+        messageLabel.Parent=play
+        local clouds={}
+        for i=1,3 do
+            local cloudY=24+(i%2)*28
+            local cloud=Instance.new("Frame")
+            cloud.BorderSizePixel=0
+            cloud.BackgroundColor3=Color3.fromRGB(46,46,56)
+            cloud.Size=UDim2.fromOffset(46,12)
+            cloud.Position=UDim2.fromOffset(i*200,cloudY)
+            cloud.Parent=play
+            clouds[i]={frame=cloud,x=i*200,y=cloudY}
+        end
+        local dinoFrame=Instance.new("Frame")
+        dinoFrame.BackgroundTransparency=1
+        dinoFrame.AnchorPoint=Vector2.new(0,1)
+        dinoFrame.Parent=play
+        local function makePart(color)
+            local f=Instance.new("Frame")
+            f.BorderSizePixel=0
+            f.BackgroundColor3=color
+            f.Parent=dinoFrame
+            return f
+        end
+        local DINO_COLOR=Color3.fromRGB(235,235,240)
+        local body=makePart(DINO_COLOR)
+        local head=makePart(DINO_COLOR)
+        local tail=makePart(DINO_COLOR)
+        local legA=makePart(DINO_COLOR)
+        local legB=makePart(DINO_COLOR)
+        local eye=makePart(Color3.fromRGB(20,20,24))
+        local function setRect(f,x,y,w,h) f.Position=UDim2.fromOffset(x,y); f.Size=UDim2.fromOffset(w,h) end
+        local function layoutDino(crouch,legStep)
+            if crouch then
+                dinoFrame.Size=UDim2.fromOffset(DUCK_W,DUCK_H)
+                setRect(body,4,4,30,12)
+                setRect(head,28,2,16,10)
+                setRect(eye,38,4,3,3)
+                setRect(tail,0,6,6,5)
+                setRect(legA,8,16,6,legStep and 6 or 4)
+                setRect(legB,20,16,6,legStep and 4 or 6)
+            else
+                dinoFrame.Size=UDim2.fromOffset(STAND_W,STAND_H)
+                setRect(body,4,12,20,16)
+                setRect(head,14,0,18,14)
+                setRect(eye,26,3,3,3)
+                setRect(tail,0,16,6,6)
+                setRect(legA,6,28,6,legStep and 8 or 5)
+                setRect(legB,16,28,6,legStep and 5 or 8)
+            end
+        end
+        local state="ready"
+        local dinoH=0
+        local vy=0
+        local ducking=false
+        local score=0
+        local speed=300
+        local obstacles={}
+        local nextSpawn=400
+        local runTimer=0
+        local stepFlag=false
+        local deadAt=0
+        local lastScoreInt=-1
+        local lastLayout=""
+        local function pad(n) return ("%05d"):format(math.floor(n)) end
+        local function updateScoreText() scoreLabel.Text="HI "..pad(highScore).."   "..pad(score) end
+        local function clearObstacles()
+            for _,o in obstacles do o.frame:Destroy() end
+            table.clear(obstacles)
+        end
+        local function resetGame()
+            clearObstacles()
+            score=0; speed=300; dinoH=0; vy=0; ducking=false
+            nextSpawn=400; runTimer=0; lastScoreInt=-1; lastLayout=""
+            updateScoreText()
+        end
+        local function spawnObstacle()
+            local frame=Instance.new("Frame")
+            frame.BorderSizePixel=0
+            frame.Parent=play
+            local o
+            if score>250 and math.random()<0.3 then
+                local bottom=(math.random()<0.5) and 26 or 60
+                local y=GROUND_Y-bottom-18
+                frame.Size=UDim2.fromOffset(34,18)
+                frame.BackgroundColor3=Color3.fromRGB(255,170,60)
+                frame.Position=UDim2.fromOffset(PLAY_W+10,y)
+                local wing=Instance.new("Frame")
+                wing.BorderSizePixel=0
+                wing.BackgroundColor3=Color3.fromRGB(255,220,140)
+                wing.Size=UDim2.fromOffset(14,6)
+                wing.Position=UDim2.fromOffset(8,-6)
+                wing.Parent=frame
+                o={frame=frame,x=PLAY_W+10,y=y,w=34,h=18,bird=true,wing=wing,flap=0}
+            else
+                local w=math.random(14,30)
+                local h=math.random(30,52)
+                local y=GROUND_Y-h
+                frame.Size=UDim2.fromOffset(w,h)
+                frame.BackgroundColor3=Color3.fromRGB(80,190,110)
+                frame.Position=UDim2.fromOffset(PLAY_W+10,y)
+                local armLeft=Instance.new("Frame")
+                armLeft.BorderSizePixel=0
+                armLeft.BackgroundColor3=frame.BackgroundColor3
+                armLeft.Size=UDim2.fromOffset(6,5)
+                armLeft.Position=UDim2.fromOffset(-6,math.floor(h*0.35))
+                armLeft.Parent=frame
+                local armRight=Instance.new("Frame")
+                armRight.BorderSizePixel=0
+                armRight.BackgroundColor3=frame.BackgroundColor3
+                armRight.Size=UDim2.fromOffset(6,5)
+                armRight.Position=UDim2.fromOffset(w,math.floor(h*0.2))
+                armRight.Parent=frame
+                o={frame=frame,x=PLAY_W+10,y=y,w=w,h=h,bird=false}
+            end
+            table.insert(obstacles,o)
+        end
+        local function isCrouching() return ducking and dinoH<=0 end
+        local function dinoRect()
+            local w=STAND_W
+            local h=STAND_H
+            if isCrouching() then w=DUCK_W; h=DUCK_H end
+            return DINO_X+5,GROUND_Y-dinoH-h+3,DINO_X+w-5,GROUND_Y-dinoH-3
+        end
+        local function refreshDino()
+            local crouch=isCrouching()
+            local legStep=state=="running" and dinoH<=0 and stepFlag
+            local key=(crouch and "d" or "s")..(legStep and "1" or "0")
+            if key~=lastLayout then lastLayout=key; layoutDino(crouch,legStep) end
+            dinoFrame.Position=UDim2.fromOffset(DINO_X,GROUND_Y-dinoH)
+        end
+        local function die()
+            state="dead"
+            deadAt=os.clock()
+            local final=math.floor(score)
+            if final>highScore then
+                highScore=final
+                saveHighScore()
+                highLabel:SetText("Best: "..tostring(highScore))
+            end
+            updateScoreText()
+            messageLabel.Text="G A M E   O V E R\npress Space / click to restart"
+        end
+        local function jump()
+            if state=="ready" then
+                state="running"
+                messageLabel.Text=""
+            elseif state=="dead" then
+                if os.clock()-deadAt>0.4 then
+                    resetGame()
+                    state="running"
+                    messageLabel.Text=""
+                end
+                return
+            end
+            if dinoH<=0 then vy=JUMP_VELOCITY end
+        end
+        local function step(dt)
+            dt=math.min(dt,0.05)
+            for _,cloud in clouds do
+                cloud.x=cloud.x-40*dt
+                if cloud.x<-60 then cloud.x=PLAY_W+math.random(20,120) end
+                cloud.frame.Position=UDim2.fromOffset(cloud.x,cloud.y)
+            end
+            if state~="running" then refreshDino(); return end
+            if dinoH>0 or vy>0 then
+                local g=GRAVITY
+                if ducking then g=g*FAST_FALL end
+                vy=vy-g*dt
+                dinoH=dinoH+vy*dt
+                if dinoH<=0 then dinoH=0; vy=0 end
+            end
+            runTimer=runTimer+dt
+            if runTimer>=0.1 then runTimer=0; stepFlag=not stepFlag end
+            score=score+speed*dt/40
+            speed=math.min(300+score*0.9,760)
+            local scoreInt=math.floor(score)
+            if scoreInt~=lastScoreInt then lastScoreInt=scoreInt; updateScoreText() end
+            nextSpawn=nextSpawn-speed*dt
+            if nextSpawn<=0 then spawnObstacle(); nextSpawn=speed*(0.85+math.random()*0.75) end
+            refreshDino()
+            local dinoLeft,dinoTop,dinoRight,dinoBottom=dinoRect()
+            for i=#obstacles,1,-1 do
+                local o=obstacles[i]
+                o.x=o.x-speed*dt
+                o.frame.Position=UDim2.fromOffset(o.x,o.y)
+                if o.bird then
+                    o.flap=o.flap+dt
+                    o.wing.Position=UDim2.fromOffset(8,(o.flap%0.3<0.15) and -6 or 16)
+                end
+                if o.x+o.w<-20 then
+                    o.frame:Destroy()
+                    table.remove(obstacles,i)
+                else
+                    local oLeft=o.x+3
+                    local oRight=o.x+o.w-3
+                    local oTop=o.y+3
+                    local oBottom=o.y+o.h-3
+                    if dinoLeft<oRight and dinoRight>oLeft and dinoTop<oBottom and dinoBottom>oTop then
+                        die()
+                        return
+                    end
+                end
+            end
+        end
+        local actionName="ChillhubDinoInput"
+        local function handleAction(_,inputState,inputObject)
+            local code=inputObject.KeyCode
+            if inputState==Enum.UserInputState.Begin then
+                if code==Enum.KeyCode.Space or code==Enum.KeyCode.Up or code==Enum.KeyCode.W then
+                    jump()
+                elseif code==Enum.KeyCode.Down or code==Enum.KeyCode.S then
+                    ducking=true
+                end
+            elseif inputState==Enum.UserInputState.End then
+                if code==Enum.KeyCode.Down or code==Enum.KeyCode.S then
+                    ducking=false
+                end
+            end
+            return Enum.ContextActionResult.Sink
+        end
+        ContextActionService:BindActionAtPriority(actionName,handleAction,false,Enum.ContextActionPriority.High.Value,Enum.KeyCode.Space,Enum.KeyCode.Up,Enum.KeyCode.W,Enum.KeyCode.Down,Enum.KeyCode.S)
+        play.InputBegan:Connect(function(input)
+            if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+                jump()
+            end
+        end)
+        local connection=RunService.Heartbeat:Connect(step)
+        resetGame()
+        messageLabel.Text="Press Space / click to start"
+        refreshDino()
+        activeGame={destroy=function()
+            connection:Disconnect()
+            stopDrag()
+            ContextActionService:UnbindAction(actionName)
+            gui:Destroy()
+        end}
+    end
+
+    GameBox:AddButton({ Text="Play Dino Run",   Func=openDino })
+    GameBox:AddButton({ Text="Close Game",       Func=closeDino })
+    GameBox:AddButton({ Text="Reset Best Score", Func=function() highScore=0; saveHighScore(); highLabel:SetText("Best: 0") end })
+    GameBox:AddLabel({ Text="Space / Up / W / click = jump. Down / S = duck. Character won't move while the game is open.", DoesWrap=true })
+    onCleanup(closeDino)
+end
+
+do
+    local CoinBox=addGroup(FunTab,"Left","Coin Flip & Dice","dices")
+    local WINDOW_W=620
+    local WINDOW_H=270
+    local PIP_PATTERNS={
+        [1]={[5]=true},
+        [2]={[1]=true,[9]=true},
+        [3]={[1]=true,[5]=true,[9]=true},
+        [4]={[1]=true,[3]=true,[7]=true,[9]=true},
+        [5]={[1]=true,[3]=true,[5]=true,[7]=true,[9]=true},
+        [6]={[1]=true,[3]=true,[4]=true,[6]=true,[7]=true,[9]=true},
+    }
+    local activeWindow=nil
+    local function closeCoinDice()
+        if activeWindow then activeWindow.destroy(); activeWindow=nil end
+    end
+    local function openCoinDice()
+        if activeWindow then return end
+        local closed=false
+        local gui=Instance.new("ScreenGui")
+        gui.Name="ChillCoinDice"
+        gui.ResetOnSpawn=false
+        gui.DisplayOrder=50
+        gui.Parent=LocalPlayer:WaitForChild("PlayerGui")
+        local window=Instance.new("Frame")
+        window.Size=UDim2.fromOffset(WINDOW_W,WINDOW_H)
+        window.Position=UDim2.new(0.5,-WINDOW_W/2,0.5,-WINDOW_H/2)
+        window.BackgroundColor3=Color3.fromRGB(20,20,24)
+        window.BorderSizePixel=0
+        window.ClipsDescendants=true
+        window.Parent=gui
+        Instance.new("UICorner",window).CornerRadius=UDim.new(0,8)
+        local titleBar=Instance.new("Frame")
+        titleBar.Size=UDim2.fromOffset(WINDOW_W,28)
+        titleBar.BackgroundColor3=Color3.fromRGB(34,34,42)
+        titleBar.BorderSizePixel=0
+        titleBar.Parent=window
+        local title=Instance.new("TextLabel")
+        title.BackgroundTransparency=1
+        title.Position=UDim2.fromOffset(10,0)
+        title.Size=UDim2.new(1,-50,1,0)
+        title.Font=Enum.Font.GothamBold
+        title.TextSize=14
+        title.TextXAlignment=Enum.TextXAlignment.Left
+        title.TextColor3=Color3.fromRGB(235,235,240)
+        title.Text="Coin Flip & Dice Roll   |   (drag me)"
+        title.Parent=titleBar
+        local closeButton=Instance.new("TextButton")
+        closeButton.Size=UDim2.fromOffset(28,28)
+        closeButton.Position=UDim2.fromOffset(WINDOW_W-28,0)
+        closeButton.BackgroundTransparency=1
+        closeButton.Font=Enum.Font.GothamBold
+        closeButton.TextSize=16
+        closeButton.TextColor3=Color3.fromRGB(255,120,120)
+        closeButton.Text="X"
+        closeButton.Parent=titleBar
+        closeButton.MouseButton1Click:Connect(closeCoinDice)
+        local stopDrag=makeDraggable(titleBar,window)
+        local divider=Instance.new("Frame")
+        divider.Position=UDim2.fromOffset(WINDOW_W/2,40)
+        divider.Size=UDim2.fromOffset(2,WINDOW_H-52)
+        divider.BackgroundColor3=Color3.fromRGB(45,45,54)
+        divider.BorderSizePixel=0
+        divider.Parent=window
+        local function makeLabel(parent,x,y,w,h,size,text)
+            local label=Instance.new("TextLabel")
+            label.BackgroundTransparency=1
+            label.Position=UDim2.fromOffset(x,y)
+            label.Size=UDim2.fromOffset(w,h)
+            label.Font=Enum.Font.GothamBold
+            label.TextSize=size
+            label.TextColor3=Color3.fromRGB(235,235,240)
+            label.Text=text
+            label.Parent=parent
+            return label
+        end
+        local function makeButton(parent,text,x,y,w,h,callback)
+            local button=Instance.new("TextButton")
+            button.Position=UDim2.fromOffset(x,y)
+            button.Size=UDim2.fromOffset(w,h)
+            button.BackgroundColor3=Color3.fromRGB(52,52,66)
+            button.AutoButtonColor=true
+            button.Font=Enum.Font.GothamBold
+            button.TextSize=14
+            button.TextColor3=Color3.fromRGB(235,235,240)
+            button.Text=text
+            button.Parent=parent
+            local corner=Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,6); corner.Parent=button
+            button.MouseButton1Click:Connect(callback)
+            return button
+        end
+        local half=WINDOW_W/2
+        local coinPanel=Instance.new("Frame")
+        coinPanel.BackgroundTransparency=1
+        coinPanel.Position=UDim2.fromOffset(0,28)
+        coinPanel.Size=UDim2.fromOffset(half,WINDOW_H-28)
+        coinPanel.Parent=window
+        makeLabel(coinPanel,0,6,half,22,15,"COIN FLIP")
+        local COIN_SIZE=96
+        local COIN_CENTER_X=half/2
+        local COIN_CENTER_Y=92
+        local coin=Instance.new("Frame")
+        coin.BackgroundColor3=Color3.fromRGB(255,200,60)
+        coin.BorderSizePixel=0
+        coin.Size=UDim2.fromOffset(COIN_SIZE,COIN_SIZE)
+        coin.Position=UDim2.fromOffset(COIN_CENTER_X-COIN_SIZE/2,COIN_CENTER_Y-COIN_SIZE/2)
+        coin.Parent=coinPanel
+        Instance.new("UICorner",coin).CornerRadius=UDim.new(1,0)
+        local coinStroke=Instance.new("UIStroke")
+        coinStroke.Color=Color3.fromRGB(190,140,20)
+        coinStroke.Thickness=4
+        coinStroke.Parent=coin
+        local coinLabel=Instance.new("TextLabel")
+        coinLabel.BackgroundTransparency=1
+        coinLabel.Size=UDim2.fromScale(1,1)
+        coinLabel.Font=Enum.Font.GothamBlack
+        coinLabel.TextSize=44
+        coinLabel.TextColor3=Color3.fromRGB(150,100,10)
+        coinLabel.Text="H"
+        coinLabel.Parent=coin
+        local coinResult=makeLabel(coinPanel,0,150,half,22,15,"Call it, then watch it spin")
+        local coinStats=makeLabel(coinPanel,0,174,half,20,12,"Streak 0   |   Best 0   |   W 0 / L 0")
+        coinStats.Font=Enum.Font.Gotham
+        coinStats.TextColor3=Color3.fromRGB(170,170,185)
+        local wins=0; local losses=0; local streak=0; local bestStreak=0
+        local coinBusy=false
+        local coinSide="Heads"
+        local function updateCoinStats()
+            coinStats.Text=("Streak %d   |   Best %d   |   W %d / L %d"):format(streak,bestStreak,wins,losses)
+        end
+        local function setCoinFace(heads)
+            coinLabel.Text=heads and "H" or "T"
+            coin.BackgroundColor3=heads and Color3.fromRGB(255,200,60) or Color3.fromRGB(235,175,40)
+        end
+        local function flipCoin(call)
+            if coinBusy or closed then return end
+            coinBusy=true
+            coinResult.Text="Flipping..."
+            local result=(math.random(2)==1) and "Heads" or "Tails"
+            local startSide=coinSide
+            local halfTurns=6+((result==startSide) and 0 or 1)
+            local duration=1.4
+            local startedAt=os.clock()
+            task.spawn(function()
+                while not closed do
+                    local t=(os.clock()-startedAt)/duration
+                    if t>=1 then break end
+                    local angle=t*math.pi*halfTurns
+                    local squash=math.max(0.06,math.abs(math.cos(angle)))
+                    local showHeads=(math.cos(angle)>=0)==(startSide=="Heads")
+                    local lift=math.sin(t*math.pi)*46
+                    local height=COIN_SIZE*squash
+                    coin.Size=UDim2.fromOffset(COIN_SIZE,height)
+                    coin.Position=UDim2.fromOffset(COIN_CENTER_X-COIN_SIZE/2,COIN_CENTER_Y-lift-height/2)
+                    coinLabel.TextSize=math.max(8,math.floor(44*squash))
+                    setCoinFace(showHeads)
+                    task.wait()
+                end
+                if closed then return end
+                coinSide=result
+                coin.Size=UDim2.fromOffset(COIN_SIZE,COIN_SIZE)
+                coin.Position=UDim2.fromOffset(COIN_CENTER_X-COIN_SIZE/2,COIN_CENTER_Y-COIN_SIZE/2)
+                coinLabel.TextSize=44
+                setCoinFace(result=="Heads")
+                if call==result then
+                    wins+=1; streak+=1; bestStreak=math.max(bestStreak,streak)
+                    coinResult.Text=result.."! You win"
+                else
+                    losses+=1; streak=0
+                    coinResult.Text=result.."! You lose"
+                end
+                updateCoinStats()
+                coinBusy=false
+            end)
+        end
+        makeButton(coinPanel,"Call Heads",30,204,110,34,function() flipCoin("Heads") end)
+        makeButton(coinPanel,"Call Tails",half-140,204,110,34,function() flipCoin("Tails") end)
+        local dicePanel=Instance.new("Frame")
+        dicePanel.BackgroundTransparency=1
+        dicePanel.Position=UDim2.fromOffset(half,28)
+        dicePanel.Size=UDim2.fromOffset(half,WINDOW_H-28)
+        dicePanel.Parent=window
+        makeLabel(dicePanel,0,6,half,22,15,"DICE ROLL")
+        local function makeDie()
+            local frame=Instance.new("Frame")
+            frame.Size=UDim2.fromOffset(80,80)
+            frame.Position=UDim2.fromOffset(0,40)
+            frame.BackgroundColor3=Color3.fromRGB(245,245,245)
+            frame.BorderSizePixel=0
+            frame.Parent=dicePanel
+            Instance.new("UICorner",frame).CornerRadius=UDim.new(0,14)
+            local stroke=Instance.new("UIStroke")
+            stroke.Color=Color3.fromRGB(150,150,160)
+            stroke.Thickness=2
+            stroke.Parent=frame
+            local pips={}
+            for index=1,9 do
+                local column=(index-1)%3
+                local row=math.floor((index-1)/3)
+                local pip=Instance.new("Frame")
+                pip.Size=UDim2.fromOffset(15,15)
+                pip.Position=UDim2.fromOffset(11+column*22,11+row*22)
+                pip.BackgroundColor3=Color3.fromRGB(30,30,36)
+                pip.BorderSizePixel=0
+                pip.Parent=frame
+                Instance.new("UICorner",pip).CornerRadius=UDim.new(1,0)
+                pips[index]=pip
+            end
+            local function setValue(value)
+                local pattern=PIP_PATTERNS[value]
+                for index,pip in pips do pip.Visible=pattern[index]==true end
+            end
+            setValue(1)
+            return {frame=frame,setValue=setValue}
+        end
+        local dice={makeDie(),makeDie()}
+        local dieCount=1
+        local diceBusy=false
+        local history={}
+        local function layoutDice()
+            if dieCount==1 then
+                dice[1].frame.Position=UDim2.fromOffset(half/2-40,40)
+                dice[2].frame.Visible=false
+            else
+                dice[1].frame.Position=UDim2.fromOffset(half/2-95,40)
+                dice[2].frame.Position=UDim2.fromOffset(half/2+15,40)
+                dice[2].frame.Visible=true
+            end
+        end
+        layoutDice()
+        local totalLabel=makeLabel(dicePanel,0,134,half,22,15,"Press roll")
+        local historyLabel=makeLabel(dicePanel,10,158,half-20,36,12,"Last rolls: none yet")
+        historyLabel.Font=Enum.Font.Gotham
+        historyLabel.TextColor3=Color3.fromRGB(170,170,185)
+        historyLabel.TextWrapped=true
+        local function rollDice()
+            if diceBusy or closed then return end
+            diceBusy=true
+            totalLabel.Text="Rolling..."
+            task.spawn(function()
+                local startedAt=os.clock()
+                while not closed and os.clock()-startedAt<0.9 do
+                    for index=1,dieCount do dice[index].setValue(math.random(1,6)) end
+                    task.wait(0.07)
+                end
+                if closed then return end
+                local total=0
+                local values={}
+                for index=1,dieCount do
+                    local value=math.random(1,6)
+                    values[index]=value
+                    total+=value
+                    dice[index].setValue(value)
+                end
+                local text="Total: "..total
+                if dieCount==2 and values[1]==values[2] then text=text.."   DOUBLES!" end
+                totalLabel.Text=text
+                table.insert(history,1,tostring(total))
+                if #history>10 then table.remove(history) end
+                historyLabel.Text="Last rolls: "..table.concat(history,", ")
+                diceBusy=false
+            end)
+        end
+        makeButton(dicePanel,"Roll",30,204,110,34,rollDice)
+        local modeButton
+        modeButton=makeButton(dicePanel,"1 Die",half-140,204,110,34,function()
+            if diceBusy then return end
+            dieCount=(dieCount==1) and 2 or 1
+            modeButton.Text=(dieCount==1) and "1 Die" or "2 Dice"
+            layoutDice()
+        end)
+        activeWindow={destroy=function() closed=true; stopDrag(); gui:Destroy() end}
+    end
+
+    CoinBox:AddButton({ Text="Open Coin Flip & Dice", Func=openCoinDice })
+    CoinBox:AddButton({ Text="Close It",              Func=closeCoinDice })
+    CoinBox:AddLabel({ Text="Call heads or tails and watch the coin spin, then roll 1 or 2 dice with animated faces.", DoesWrap=true })
+    onCleanup(closeCoinDice)
+end
+
+do
+    local FunBox=addGroup(FunTab,"Right","Character Fun","smile")
+
+    FunBox:AddToggle("Fun_Spin",     { Text="Spin",       Default=false, Callback=function(value) setAutoRotateLock("spin",value) end })
+    FunBox:AddSlider("Fun_SpinSpeed",{ Text="Spin Speed", Min=1, Max=40, Default=10, Rounding=0 })
+    connect(RunService.Heartbeat,function(dt)
+        if not Toggles.Fun_Spin.Value or isRagdolled(getHumanoid()) then return end
+        local root=getRoot()
+        if root then root.CFrame=root.CFrame*CFrame.Angles(0,math.rad(Options.Fun_SpinSpeed.Value*36)*dt,0) end
+    end)
+    onCleanup(function() setAutoRotateLock("spin",false) end)
+
+    local rainbowOriginals={}
+    connect(LocalPlayer.CharacterAdded,function() table.clear(rainbowOriginals) end)
+    FunBox:AddToggle("Fun_Rainbow",{ Text="Rainbow Character", Default=false, Callback=function(value)
+        if not value then
+            for part,color in rainbowOriginals do
+                if part.Parent then part.Color=color end
+                rainbowOriginals[part]=nil
+            end
+        end
+    end })
+    connect(RunService.Heartbeat,function()
+        if not Toggles.Fun_Rainbow.Value then return end
+        local character=LocalPlayer.Character
+        if not character then return end
+        local color=Color3.fromHSV((os.clock()*0.3)%1,0.8,1)
+        for _,part in character:GetDescendants() do
+            if part:IsA("BasePart") and part.Name~="HumanoidRootPart" then
+                if not rainbowOriginals[part] then rainbowOriginals[part]=part.Color end
+                part.Color=color
+            end
+        end
+    end)
+
+    local trailObjects=nil
+    local function removeTrail()
+        if trailObjects then
+            trailObjects.trail:Destroy()
+            trailObjects.a0:Destroy()
+            trailObjects.a1:Destroy()
+            trailObjects=nil
+        end
+    end
+    local trailToggle=FunBox:AddToggle("Fun_Trail",{ Text="Character Trail", Default=false, Callback=function(value)
+        if not value then removeTrail() end
+    end })
+    trailToggle:AddColorPicker("Fun_TrailColor",{ Default=Color3.fromRGB(255,80,200), Title="Trail Color" })
+    FunBox:AddToggle("Fun_TrailRainbow",{ Text="Rainbow Trail", Default=false })
+    FunBox:AddSlider("Fun_TrailLifetime",{ Text="Trail Length", Min=0.2, Max=3, Default=0.9, Rounding=1, Suffix="s" })
+    FunBox:AddSlider("Fun_TrailWidth",   { Text="Trail Width",  Min=0.5, Max=6, Default=2.4, Rounding=1, Suffix=" studs" })
+
+    task.spawn(function()
+        while not unloaded do
+            if Toggles.Fun_Trail.Value then
+                local root=getRoot()
+                if root then
+                    if not trailObjects or trailObjects.root~=root or not trailObjects.trail.Parent then
+                        removeTrail()
+                        local a0=Instance.new("Attachment"); a0.Name="ChillTrailTop"; a0.Parent=root
+                        local a1=Instance.new("Attachment"); a1.Name="ChillTrailBottom"; a1.Parent=root
+                        local trail=Instance.new("Trail")
+                        trail.Name="ChillTrail"
+                        trail.Attachment0=a0
+                        trail.Attachment1=a1
+                        trail.FaceCamera=true
+                        trail.LightEmission=1
+                        trail.LightInfluence=0
+                        trail.MinLength=0.05
+                        trail.Transparency=NumberSequence.new(0,1)
+                        trail.Enabled=true
+                        trail.Parent=root
+                        trailObjects={root=root,a0=a0,a1=a1,trail=trail}
+                    end
+                    local width=Options.Fun_TrailWidth.Value
+                    trailObjects.a0.Position=Vector3.new(0,width/2,0)
+                    trailObjects.a1.Position=Vector3.new(0,-width/2,0)
+                    trailObjects.trail.Lifetime=Options.Fun_TrailLifetime.Value
+                    if Toggles.Fun_TrailRainbow.Value then
+                        local hue=(os.clock()*0.4)%1
+                        trailObjects.trail.Color=ColorSequence.new({
+                            ColorSequenceKeypoint.new(0,Color3.fromHSV(hue,0.9,1)),
+                            ColorSequenceKeypoint.new(0.5,Color3.fromHSV((hue+0.15)%1,0.9,1)),
+                            ColorSequenceKeypoint.new(1,Color3.fromHSV((hue+0.3)%1,0.9,1)),
+                        })
+                    else
+                        trailObjects.trail.Color=ColorSequence.new(Options.Fun_TrailColor.Value)
+                    end
+                end
+            end
+            task.wait(0.1)
+        end
+    end)
+    onCleanup(removeTrail)
+
+    FunBox:AddButton({ Text="Sit", Func=function()
+        local h=getHumanoid()
+        if h then h.Sit=true end
+    end })
+
+    do
+        local drunkColorCorrect = Instance.new("ColorCorrectionEffect")
+        drunkColorCorrect.Saturation = 0
+        drunkColorCorrect.Enabled    = false
+        drunkColorCorrect.Parent     = Lighting
+
+        local drunkBlur = Instance.new("BlurEffect")
+        drunkBlur.Size    = 0
+        drunkBlur.Enabled = false
+        drunkBlur.Parent  = Lighting
+
+        local drunkTime = 0
+
+        FunBox:AddToggle("Fun_DrunkMode", { Text = "Drunk Mode 🍺", Default = false,
+            Callback = function(on)
+                drunkColorCorrect.Enabled = on
+                drunkBlur.Enabled         = on
+                if not on then
+                    drunkBlur.Size               = 0
+                    drunkColorCorrect.Saturation  = 0
+                    drunkColorCorrect.TintColor   = Color3.new(1, 1, 1)
+                    drunkTime = 0
+                end
+            end
+        })
+        FunBox:AddSlider("Fun_DrunkIntensity", {
+            Text    = "Drunk Intensity",
+            Min     = 1, Max = 10, Default = 5, Rounding = 0,
+            Tooltip = "How hammered are we? 1 = tipsy, 10 = horizontal"
+        })
+
+        connect(RunService.RenderStepped, function(dt)
+            if not Toggles.Fun_DrunkMode or not Toggles.Fun_DrunkMode.Value then return end
+            local camera = workspace.CurrentCamera
+            if not camera then return end
+            local intensity = Options.Fun_DrunkIntensity.Value / 10
+            drunkTime = drunkTime + dt
+            local rollAmp   = math.rad(7   * intensity)
+            local pitchAmp  = math.rad(3.5 * intensity)
+            local roll  = rollAmp  * math.sin(drunkTime * 0.6  * math.pi * 2)
+            local pitch = pitchAmp * math.sin(drunkTime * 0.85 * math.pi * 2 + 1.3)
+            camera.CFrame = camera.CFrame * CFrame.Angles(pitch, 0, roll)
+            drunkBlur.Size = math.clamp(8 * intensity * ((math.sin(drunkTime * 1.1 * math.pi * 2) + 1) / 2), 0, 28)
+            local tintT = (math.sin(drunkTime * 0.35 * math.pi * 2) + 1) / 2
+            drunkColorCorrect.TintColor = Color3.fromRGB(255, math.floor(210 + 45 * tintT), math.floor(190 + 65 * (1 - tintT)))
+            drunkColorCorrect.Saturation = -0.2 * intensity * (math.sin(drunkTime * 0.7) + 1)
+        end)
+
+        onCleanup(function()
+            pcall(function() drunkBlur:Destroy() end)
+            pcall(function() drunkColorCorrect:Destroy() end)
+        end)
+    end
+
+    local WorldFunBox=addGroup(FunTab,"Left","World Fun","sparkles")
+    local savedDisco=nil
+    WorldFunBox:AddToggle("Fun_Disco",{ Text="Disco Lighting", Default=false, Callback=function(value)
+        if value then
+            savedDisco={
+                Ambient=Lighting.Ambient,
+                OutdoorAmbient=Lighting.OutdoorAmbient,
+                ColorShift_Top=Lighting.ColorShift_Top,
+                ColorShift_Bottom=Lighting.ColorShift_Bottom,
+            }
+        elseif savedDisco then
+            for prop,original in savedDisco do Lighting[prop]=original end
+            savedDisco=nil
+        end
+    end })
+    WorldFunBox:AddSlider("Fun_DiscoSpeed",{ Text="Disco Speed", Min=1, Max=10, Default=3, Rounding=0 })
+    connect(RunService.Heartbeat,function()
+        if not Toggles.Fun_Disco.Value then return end
+        local hue=(os.clock()*Options.Fun_DiscoSpeed.Value*0.1)%1
+        local color=Color3.fromHSV(hue,0.8,1)
+        Lighting.Ambient=color
+        Lighting.OutdoorAmbient=color
+        Lighting.ColorShift_Top=color
+        Lighting.ColorShift_Bottom=Color3.fromHSV((hue+0.5)%1,0.8,1)
+    end)
+    onCleanup(function()
+        if savedDisco then
+            for prop,original in savedDisco do Lighting[prop]=original end
+            savedDisco=nil
+        end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- MUSIC
+-- ---------------------------------------------------------------------------
+do
+    local PlayerBox=addGroup(MusicTab,"Left","Music Player","music")
+    local ControlBox=addGroup(MusicTab,"Right","Controls","sliders-horizontal")
+    local PlaylistBox=addGroup(MusicTab,"Right","Playlist","list-music")
+
+    local playlist={}
+    for _,track in MUSIC_TRACKS do
+        table.insert(playlist,{name=track.name,ids=track.ids})
+    end
+    local function trackNames()
+        local names={}
+        for _,track in playlist do table.insert(names,track.name) end
+        return names
+    end
+
+    local sound=Instance.new("Sound")
+    sound.Name="ChillhubMusic"
+    sound.Volume=0.5
+    sound.Parent=SoundService
+
+    local currentIndex=0
+    local playToken=0
+    local nowPlaying=PlayerBox:AddLabel({ Text="Now Playing: nothing", DoesWrap=true })
+    local function setStatus(text) nowPlaying:SetText(text) end
+
+    PlayerBox:AddDropdown("Music_Track",{ Values=trackNames(), Default=1, Text="Track" })
+    local function selectedIndex()
+        local value=Options.Music_Track.Value
+        for i,track in playlist do
+            if track.name==value then return i end
+        end
+        return 1
+    end
+    local function refreshDropdown()
+        pcall(function() Options.Music_Track:SetValues(trackNames()) end)
+    end
+    local function applySource(track,candidate)
+        if track.file then
+            local ok,asset=pcall(function() return getcustomasset(track.file) end)
+            if not ok or not asset then return false end
+            sound.SoundId=asset
+        else
+            sound.SoundId="rbxassetid://"..candidate
+        end
+        return true
+    end
+    local function playTrack(index)
+        local track=playlist[index]
+        if not track then return end
+        currentIndex=index
+        playToken+=1
+        local token=playToken
+        setStatus("Loading: "..track.name.."...")
+        task.spawn(function()
+            local candidates=track.file and {"file"} or track.ids
+            for _,candidate in candidates do
+                if token~=playToken then return end
+                sound:Stop()
+                if applySource(track,candidate) then
+                    sound.TimePosition=0
+                    sound:Play()
+                    local waited=0
+                    while token==playToken and not sound.IsLoaded and waited<5 do
+                        task.wait(0.1)
+                        waited+=0.1
+                    end
+                    if token~=playToken then return end
+                    if sound.IsLoaded and sound.TimeLength>0 then
+                        setStatus("Now Playing: "..track.name)
+                        return
+                    end
+                end
+            end
+            if token==playToken then
+                sound:Stop()
+                setStatus("Couldn't load: "..track.name)
+                Library:Notify("Couldn't play "..track.name..". Its audio IDs may be private or removed.",7)
+            end
+        end)
+    end
+    local function nextIndex(step)
+        if #playlist==0 then return 0 end
+        if Toggles.Music_Shuffle.Value and #playlist>1 then
+            local pick=currentIndex
+            while pick==currentIndex do pick=math.random(1,#playlist) end
+            return pick
+        end
+        return ((currentIndex-1+step)%#playlist)+1
+    end
+    local playButton=PlayerBox:AddButton({ Text="Play", Func=function() playTrack(selectedIndex()) end })
+    playButton:AddButton({ Text="Pause / Resume", Func=function()
+        if sound.IsPaused then sound:Resume() elseif sound.IsPlaying then sound:Pause() end
+    end })
+    local prevButton=PlayerBox:AddButton({ Text="Previous", Func=function() playTrack(nextIndex(-1)) end })
+    prevButton:AddButton({ Text="Next", Func=function() playTrack(nextIndex(1)) end })
+    PlayerBox:AddButton({ Text="Stop", Func=function() playToken+=1; sound:Stop(); setStatus("Now Playing: nothing") end })
+    PlayerBox:AddLabel({ Text="Only you can hear this. Paste custom audio IDs in the playlist below.", DoesWrap=true })
+
+    ControlBox:AddSlider("Music_Volume",{ Text="Volume",         Min=0,   Max=100, Default=50, Rounding=0, Suffix="%", Callback=function(v) sound.Volume=v/100 end })
+    ControlBox:AddSlider("Music_Speed", { Text="Playback Speed", Min=0.5, Max=2,   Default=1,  Rounding=2, Suffix="x", Callback=function(v) sound.PlaybackSpeed=v end })
+    ControlBox:AddToggle("Music_Loop",    { Text="Loop Track",    Default=false, Callback=function(v) sound.Looped=v end })
+    ControlBox:AddToggle("Music_Shuffle", { Text="Shuffle",       Default=false })
+    ControlBox:AddToggle("Music_AutoNext",{ Text="Auto Play Next",Default=true })
+    connect(sound.Ended,function()
+        if Toggles.Music_AutoNext.Value then playTrack(nextIndex(1))
+        else setStatus("Finished") end
+    end)
+
+    local function formatTime(seconds)
+        return ("%d:%02d"):format(math.floor(seconds/60),math.floor(seconds%60))
+    end
+    task.spawn(function()
+        while not unloaded do
+            local track=playlist[currentIndex]
+            if track and sound.IsLoaded and sound.TimeLength>0 and (sound.IsPlaying or sound.IsPaused) then
+                local prefix=sound.IsPaused and "Paused: " or "Now Playing: "
+                setStatus(prefix..track.name.."  ("..formatTime(sound.TimePosition).." / "..formatTime(sound.TimeLength)..")")
+            end
+            task.wait(0.5)
+        end
+    end)
+
+    PlaylistBox:AddInput("Music_CustomId",{ Text="Custom Audio ID", Default="", Numeric=false, Finished=false, Placeholder="paste a Roblox audio ID" })
+    PlaylistBox:AddButton({ Text="Add To Playlist", Func=function()
+        local id=tostring(Options.Music_CustomId.Value or ""):gsub("%D","")
+        if id=="" then Library:Notify("Paste an audio ID first",3); return end
+        table.insert(playlist,{name="Custom "..id,ids={id}})
+        refreshDropdown()
+        Library:Notify("Added Custom "..id.." to the playlist",3)
+    end })
+
+    local MUSIC_FOLDER="ChillhubTSB/music"
+    PlaylistBox:AddButton({ Text="Scan Local Music Folder", Func=function()
+        if type(listfiles)~="function" or type(getcustomasset)~="function" then
+            Library:Notify("Your executor doesn't support listfiles / getcustomasset",5)
+            return
+        end
+        pcall(function()
+            if type(makefolder)=="function" and type(isfolder)=="function" then
+                if not isfolder("ChillhubTSB") then makefolder("ChillhubTSB") end
+                if not isfolder(MUSIC_FOLDER) then makefolder(MUSIC_FOLDER) end
+            end
+        end)
+        local ok,files=pcall(listfiles,MUSIC_FOLDER)
+        if not ok then Library:Notify("Put .mp3 / .ogg files in workspace/"..MUSIC_FOLDER.." then scan again",6); return end
+        local added=0
+        for _,path in files do
+            local lower=path:lower()
+            if lower:match("%.mp3$") or lower:match("%.ogg$") then
+                local exists=false
+                for _,track in playlist do
+                    if track.file==path then exists=true end
+                end
+                if not exists then
+                    local fileName=path:match("([^/\\]+)$") or path
+                    table.insert(playlist,{name="File: "..fileName,file=path})
+                    added+=1
+                end
+            end
+        end
+        refreshDropdown()
+        if added>0 then
+            Library:Notify("Added "..added.." local file(s)",4)
+        else
+            Library:Notify("No new .mp3 / .ogg files in workspace/"..MUSIC_FOLDER,5)
+        end
+    end })
+    onCleanup(function() playToken+=1; sound:Destroy() end)
+end
+
+-- ---------------------------------------------------------------------------
+-- LOADER
+-- ---------------------------------------------------------------------------
+do
+    local ExternalBox=addGroup(LoaderTab,"Left","External Scripts","terminal")
+    local function loadExternal(name,url)
+        local ok,err=pcall(function() loadstring(game:HttpGet(url))() end)
+        if ok then Library:Notify(name.." loaded",4)
+        else Library:Notify("Failed to load "..name..": "..tostring(err),6); warn("[Loader] "..name.." failed:",err) end
+    end
+    ExternalBox:AddButton({ Text="Infinite Yield", Func=function() loadExternal("Infinite Yield","https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source") end })
+    ExternalBox:AddButton({ Text="Dex Explorer",   Func=function() loadExternal("Dex Explorer",  "https://raw.githubusercontent.com/infyiff/backup/main/dex.lua") end })
+    ExternalBox:AddButton({ Text="SimpleSpy",      Func=function() loadExternal("SimpleSpy",     "https://raw.githubusercontent.com/exxtremestuffs/SimpleSpySource/master/SimpleSpy.lua") end })
+end
+
+-- ---------------------------------------------------------------------------
+-- QUALITY OF LIFE
+-- ---------------------------------------------------------------------------
+local themeUiReady=false
+do
+    local UtilBox=addGroup(QoLTab,"Left","Utility","wrench")
+    UtilBox:AddToggle("QoL_AntiAFK",{ Text="Anti AFK", Default=true })
+    connect(LocalPlayer.Idled,function()
+        if Toggles.QoL_AntiAFK.Value then
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end
+    end)
+    UtilBox:AddToggle("QoL_JoinLeave",{ Text="Join / Leave Notifications", Default=false })
+    connect(Players.PlayerAdded,  function(plr) if Toggles.QoL_JoinLeave.Value then Library:Notify(plr.DisplayName.." joined",3) end end)
+    connect(Players.PlayerRemoving,function(plr) if Toggles.QoL_JoinLeave.Value then Library:Notify(plr.DisplayName.." left",  3) end end)
+    UtilBox:AddToggle("QoL_FpsUnlock",{ Text="FPS Cap", Default=false, Callback=function(value)
+        if type(setfpscap)~="function" then
+            if value then Library:Notify("Your executor doesn't support setfpscap",4) end
+            return
+        end
+        setfpscap(value and Options.QoL_FpsCap.Value or 60)
+    end })
+    UtilBox:AddSlider("QoL_FpsCap",  { Text="FPS Cap Value", Min=60, Max=9999, Default=144, Rounding=0, Callback=function(value)
+        if type(setfpscap)=="function" and Toggles.QoL_FpsUnlock and Toggles.QoL_FpsUnlock.Value then setfpscap(value) end
+    end })
+    UtilBox:AddButton({ Text="Reset Character", Func=function()
+        local h=getHumanoid(); if h then h.Health=0 end
+    end })
+    UtilBox:AddButton({ Text="Copy Job ID", Func=function()
+        if copy(game.JobId) then Library:Notify("Job ID copied",3)
+        else Library:Notify("Your executor doesn't support setclipboard",4) end
+    end })
+    UtilBox:AddButton({ Text="Server Hop", Func=function()
+        Library:Notify("Searching for a server...",3)
+        task.spawn(function()
+            local ok,result=pcall(function()
+                return HttpService:JSONDecode(game:HttpGet(("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(game.PlaceId)))
+            end)
+            if not ok or not result or not result.data then
+                Library:Notify("Couldn't fetch server list",5); return
+            end
+            for _,server in result.data do
+                if server.id~=game.JobId and server.playing<server.maxPlayers then
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId,server.id,LocalPlayer)
+                    return
+                end
+            end
+            Library:Notify("No other servers found",4)
+        end)
+    end })
+
+    local ThemeBox=addGroup(QoLTab,"Left","Theme","palette")
+    local themeNames={"Default","BBot","Fatality","Jester","Mint","Tokyo Night","Ubuntu","Quartz"}
+    if okTheme and ThemeManager and type(ThemeManager.BuiltInThemes)=="table" then
+        local sorted={}
+        for name,data in pairs(ThemeManager.BuiltInThemes) do
+            table.insert(sorted,{name=name,order=(type(data)=="table" and tonumber(data[1])) or 0})
+        end
+        if #sorted>0 then
+            table.sort(sorted,function(a,b) return a.order<b.order end)
+            themeNames={}
+            for _,entry in sorted do table.insert(themeNames,entry.name) end
+        end
+    end
+    ThemeBox:AddDropdown("QoL_Theme",{ Values=themeNames, Default=1, Text="Theme", Callback=function(name)
+        if not themeUiReady then return end
+        if not (okTheme and ThemeManager) then Library:Notify("ThemeManager failed to load",4); return end
+        local list=Options.ThemeManager_ThemeList
+        if list and list.Value~=name then
+            list:SetValue(name)
+        else
+            pcall(function() ThemeManager:ApplyTheme(name) end)
+        end
+    end })
+
+    local CleanBox=addGroup(QoLTab,"Right","Visual Cleanup","sun")
+    local qolDisabledEffects={}
+    CleanBox:AddToggle("QoL_NoEffects",{ Text="Remove Screen Effects (blur, bloom, etc)", Default=false, Callback=function(on)
+        for _,effect in Lighting:GetChildren() do
+            if effect:IsA("PostEffect") then
+                if on then
+                    if effect.Enabled then qolDisabledEffects[effect]=true; effect.Enabled=false end
+                elseif qolDisabledEffects[effect] then
+                    effect.Enabled=true; qolDisabledEffects[effect]=nil
+                end
+            end
+        end
+    end })
+    local savedClock=nil
+    CleanBox:AddToggle("QoL_AlwaysDay",{ Text="Always Day", Default=false, Callback=function(on)
+        if on then savedClock=Lighting.ClockTime
+        elseif savedClock then Lighting.ClockTime=savedClock; savedClock=nil end
+    end })
+    local savedFog=nil
+    CleanBox:AddToggle("QoL_NoFog",{ Text="Remove Fog", Default=false, Callback=function(on)
+        if on then savedFog=Lighting.FogEnd; Lighting.FogEnd=100000
+        elseif savedFog then Lighting.FogEnd=savedFog; savedFog=nil end
+    end })
+    connect(RunService.Heartbeat,function()
+        if Toggles.QoL_AlwaysDay.Value then Lighting.ClockTime=14 end
+        if Toggles.QoL_NoFog.Value and Lighting.FogEnd<100000 then Lighting.FogEnd=100000 end
+    end)
+    CleanBox:AddToggle("QoL_HideChat",      { Text="Hide Chat",        Default=false, Callback=function(on) pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat,      not on) end) end })
+    CleanBox:AddToggle("QoL_HidePlayerList",{ Text="Hide Player List", Default=false, Callback=function(on) pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList,not on) end) end })
+    onCleanup(function()
+        pcall(function()
+            StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat,true)
+            StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList,true)
+        end)
+    end)
+end
+
+do
+    local ServerBox=addGroup(QoLTab,"Right","Server Tools","server")
+    ServerBox:AddInput("QoL_JobId",{ Text="Job ID", Default="", Numeric=false, Finished=false, Placeholder="paste a Job ID" })
+    ServerBox:AddButton({ Text="Join Job ID", Func=function()
+        local jobId=tostring(Options.QoL_JobId.Value or ""):gsub("%s+","")
+        if jobId=="" then Library:Notify("Paste a Job ID first",3); return end
+        local ok,err=pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId,jobId,LocalPlayer)
+        end)
+        if not ok then Library:Notify("Couldn't join that server: "..tostring(err),5) end
+    end })
+    ServerBox:AddButton({ Text="Copy Place ID", Func=function()
+        if copy(tostring(game.PlaceId)) then Library:Notify("Place ID copied",3)
+        else Library:Notify("Your executor doesn't support setclipboard",4) end
+    end })
+    ServerBox:AddToggle("QoL_AutoReconnect",{ Text="Auto Reconnect On Kick", Default=false, Tooltip="Rejoins when Roblox shows a kick / disconnect prompt." })
+    task.spawn(function()
+        local ok,overlay=pcall(function()
+            local gui=game:GetService("CoreGui"):WaitForChild("RobloxPromptGui",10)
+            return gui and gui:WaitForChild("promptOverlay",10)
+        end)
+        if not ok or not overlay then return end
+        connect(overlay.ChildAdded,function(child)
+            if child.Name=="ErrorPrompt" and Toggles.QoL_AutoReconnect.Value then
+                task.wait(2)
+                pcall(function() TeleportService:Teleport(game.PlaceId,LocalPlayer) end)
+            end
+        end)
+    end)
+    local InfoBox=addGroup(QoLTab,"Right","Game Info","info")
+    local gameLabel=InfoBox:AddLabel({ Text="Game: loading...", DoesWrap=true })
+    InfoBox:AddLabel("Place ID: "..tostring(game.PlaceId))
+    task.spawn(function()
+        local ok,info=pcall(function() return MarketplaceService:GetProductInfoAsync(game.PlaceId) end)
+        if not ok then
+            ok,info=pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
+        end
+        if ok and info then gameLabel:SetText("Game: "..tostring(info.Name))
+        else gameLabel:SetText("Game: unknown") end
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- SETTINGS
+-- ---------------------------------------------------------------------------
+do
+    local MenuGroup=addGroup(SettingsTab,"Right","Menu","menu")
+    MenuGroup:AddButton({ Text="Turn Off All Features", Tooltip="Switches off every feature toggle and restores lighting, camera, collisions and colors.", Func=function()
+        local names={
+            "XRay_Enabled","Fullbright_Enabled","LowQuality_Enabled","Camera_UnlockZoom","Crosshair_Enabled",
+            "Fun_Disco","Fun_Rainbow","Fun_Spin","Fun_Trail","Fun_DrunkMode",
+            "Universal_Noclip","Universal_Flying_Enabled","Universal_Speed_Enabled","Universal_Jump_Enabled",
+            "Universal_Gravity_Enabled","Universal_InfJump","Spectate_Enabled","Attach_Enabled","AntiVoid_Enabled",
+            "QoL_NoEffects","QoL_AlwaysDay","QoL_NoFog",
+            "Dash_Enabled","Dash_Tracker","Combat_Safezone_Enabled","Warning_LowHealth","NoShake_Enabled",
+            "FlingAura_Enabled","LethalDash_Enabled","MeowTech_Enabled","ESP_Skeleton",
+        }
+        for _,name in names do
+            local toggle=Toggles[name]
+            if toggle then pcall(function() toggle:SetValue(false) end) end
+        end
+        Library:Notify("All features turned off",3)
+    end })
+    MenuGroup:AddButton({ Text="Unload Script", Func=function() Library:Unload() end })
+    pcall(function() MenuGroup:AddToggle("KeybindMenuOpen",{ Default=Library.KeybindFrame.Visible, Text="Show Keybind List", Callback=function(value) Library.KeybindFrame.Visible=value end }) end)
+    pcall(function() MenuGroup:AddToggle("ShowCustomCursor",{ Text="Custom Cursor", Default=true, Callback=function(value) Library.ShowCustomCursor=value end }) end)
+    pcall(function() MenuGroup:AddDropdown("NotificationSide",{ Values={"Left","Right"}, Default="Right", Text="Notification Side", Callback=function(value) Library:SetNotifySide(value) end }) end)
+    pcall(function() MenuGroup:AddDropdown("DPIDropdown",{ Values={"50%","75%","100%","125%","150%","175%","200%"}, Default="100%", Text="DPI Scale", Callback=function(value)
+        local dpi=tonumber((value:gsub("%%","")))
+        if dpi then Library:SetDPIScale(dpi) end
+    end }) end)
+
+    Library:OnUnload(function()
+        unloaded=true
+        for _,c in connections do pcall(function() c:Disconnect() end) end
+        for _,fn in cleanupFns do pcall(fn) end
+    end)
+
+    if okTheme and ThemeManager then
+        ThemeManager:SetLibrary(Library)
+        ThemeManager:SetFolder("ChillhubTSB")
+        ThemeManager:ApplyToTab(SettingsTab)
+    else
+        warn("[Chillhub] ThemeManager failed to load:",ThemeManager)
+    end
+
+    if okSave and SaveManager then
+        SaveManager:SetLibrary(Library)
+        if okTheme then SaveManager:IgnoreThemeSettings() end
+        SaveManager:SetIgnoreIndexes({"MenuKeybind","QoL_Theme"})
+        SaveManager:SetFolder("ChillhubTSB")
+        SaveManager:BuildConfigSection(SettingsTab)
+        SaveManager:LoadAutoloadConfig()
+    else
+        warn("[Chillhub] SaveManager failed to load:",SaveManager)
+    end
+end
+
+themeUiReady=true
+
+end
+
+-- ---------------------------------------------------------------------------
+-- build + boot
+-- ---------------------------------------------------------------------------
+local okBuild,buildErr=xpcall(buildUI,function(e)
+    return tostring(e).."\n"..debug.traceback()
+end)
+if not okBuild then
+    warn("[Chillhub] UI build failed:",buildErr)
+    pcall(function()
+        Loading:ShowErrorPage(true)
+        Loading:SetErrorMessage("Failed to build the UI, check the console (F9) for details.")
+    end)
+    return
+end
+
+pcall(function()
+    Loading:SetCurrentStep(4)
+    Loading:Continue()
+end)
+Library:Notify("Chillhub has loaded",6)
+Library:Notify("Chillhub has loaded",6)
